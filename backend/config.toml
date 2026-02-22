@@ -1,5 +1,5 @@
 # Absolute path only. The backend refuses to start if this path is invalid.
-root_dir = "/tmp/mlist-files"
+root_dir = "/mlist-files"
 
 # Backend bind address.
 bind_addr = "0.0.0.0:3000"

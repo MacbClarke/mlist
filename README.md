@@ -109,7 +109,6 @@ docker build -t mlist:local .
 
 ```bash
 docker run --rm -p 3000:3000 \
-  -v /your/files:/tmp/mlist-files \
+  -v /your/files:/mlist-files \
   mlist:local
 ```
-

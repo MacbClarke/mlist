@@ -33,8 +33,8 @@ COPY --from=backend-builder /src/backend/target/release/backend /app/backend
 COPY --from=frontend-builder /src/frontend/dist /app/frontend-dist
 COPY backend/config.toml /app/config.toml
 
-RUN mkdir -p /tmp/mlist-files \
-    && chown -R mlist:mlist /app /tmp/mlist-files
+RUN mkdir -p /mlist-files \
+    && chown -R mlist:mlist /app /mlist-files
 
 USER mlist
 

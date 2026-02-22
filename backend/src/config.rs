@@ -16,7 +16,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            root_dir: PathBuf::from("/tmp/mlist-files"),
+            root_dir: PathBuf::from("/mlist-files"),
             bind_addr: "0.0.0.0:3000".to_string(),
             session_ttl_seconds: 1800,
             secure_cookies: false,

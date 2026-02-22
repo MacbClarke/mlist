@@ -1,0 +1,18 @@
+# Absolute path only. The backend refuses to start if this path is invalid.
+root_dir = "/tmp/mlist-files"
+
+# Backend bind address.
+bind_addr = "0.0.0.0:3000"
+
+# Session expiration in seconds.
+session_ttl_seconds = 1800
+
+# Set true when serving over HTTPS in production.
+secure_cookies = false
+
+# Login throttling for private directories.
+login_max_failures = 5
+login_block_seconds = 60
+
+# Tight default policy for this app.
+content_security_policy = "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; frame-ancestors 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';"

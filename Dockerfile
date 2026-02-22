@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-bookworm-slim AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 WORKDIR /src/frontend
 
 RUN corepack enable
@@ -12,7 +12,7 @@ COPY frontend/ ./
 RUN pnpm run build
 
 
-FROM rust:1.91-bookworm AS backend-builder
+FROM rust:1.91-alpine AS backend-builder
 WORKDIR /src/backend
 
 COPY backend/Cargo.toml backend/Cargo.lock ./
@@ -20,15 +20,14 @@ COPY backend/src ./src
 RUN cargo build --release
 
 
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.21 AS runtime
 
 ENV RUST_LOG=backend=info,tower_http=info
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home --home-dir /app mlist
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S mlist \
+    && adduser -S -u 10001 -G mlist mlist
 
 COPY --from=backend-builder /src/backend/target/release/backend /app/backend
 COPY --from=frontend-builder /src/frontend/dist /app/frontend-dist

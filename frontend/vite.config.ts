@@ -53,6 +53,9 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    sourcemap: false,
+  },
   server: {
     port: 5173,
     proxy: {

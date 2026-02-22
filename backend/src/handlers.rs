@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -343,6 +343,7 @@ pub async fn login_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     ConnectInfo(connect_info): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
     let relative_path = normalize_relative_path(Some(&payload.path))?;
@@ -359,7 +360,7 @@ pub async fn login_handler(
     };
 
     let now = now_unix();
-    let client_ip = connect_info.ip().to_string();
+    let client_ip = client_ip_for_request(&headers, connect_info.ip()).to_string();
     let limiter_key = format!("{client_ip}:{}", anchor.scope_rel);
 
     if let Some(until) = state.login_limiter.blocked_until(&limiter_key, now).await {
@@ -452,6 +453,34 @@ pub async fn me_handler(
         scopes: session_view.scopes,
         expires_at: Some(session_view.expires_at),
     }))
+}
+
+fn client_ip_for_request(headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
+    parse_x_forwarded_for(headers)
+        .or_else(|| parse_x_real_ip(headers))
+        .unwrap_or(peer_ip)
+}
+
+fn parse_x_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
+    let raw = headers.get("x-forwarded-for")?.to_str().ok()?;
+    raw.split(',')
+        .map(str::trim)
+        .find_map(parse_forwarded_ip_token)
+}
+
+fn parse_x_real_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let raw = headers.get("x-real-ip")?.to_str().ok()?;
+    parse_forwarded_ip_token(raw.trim())
+}
+
+fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    raw.parse::<IpAddr>()
+        .ok()
+        .or_else(|| raw.parse::<SocketAddr>().ok().map(|value| value.ip()))
 }
 
 fn build_session_cookie(
@@ -617,9 +646,12 @@ fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> 
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
     use std::path::Path;
 
-    use super::{content_disposition_inline, parse_range_header};
+    use axum::http::HeaderMap;
+
+    use super::{content_disposition_inline, parse_range_header, parse_x_forwarded_for};
 
     #[test]
     fn range_parses_open_ended() {
@@ -660,5 +692,30 @@ mod tests {
         assert!(
             disposition.contains("filename*=UTF-8''%E4%BD%A0%E5%A5%BD%20%E5%AD%97%E5%B9%95.ass")
         );
+    }
+
+    #[test]
+    fn x_forwarded_for_uses_first_valid_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "unknown, 203.0.113.8".parse().unwrap());
+
+        let ip = parse_x_forwarded_for(&headers).unwrap();
+        assert_eq!(ip, "203.0.113.8".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn x_forwarded_for_accepts_socket_address_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.1:45321".parse().unwrap());
+
+        let ip = parse_x_forwarded_for(&headers).unwrap();
+        assert_eq!(ip, "198.51.100.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn x_forwarded_for_returns_none_for_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "unknown, garbage".parse().unwrap());
+        assert!(parse_x_forwarded_for(&headers).is_none());
     }
 }

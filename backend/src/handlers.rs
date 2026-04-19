@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::Body;
@@ -11,6 +11,7 @@ use axum::response::Response;
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::{Deserialize, Serialize};
+use time::{Month, OffsetDateTime, UtcOffset, Weekday};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
@@ -286,9 +287,6 @@ async fn serve_file_response(
         }
     }
 
-    let mut file = fs::File::open(&resolved)
-        .await
-        .map_err(|err| ApiError::from_io(err, "file"))?;
     let file_size = metadata.len();
     let mime = mime_guess::from_path(&resolved)
         .first_or_octet_stream()
@@ -296,11 +294,57 @@ async fn serve_file_response(
         .to_string();
     let content_disposition = content_disposition_inline(&resolved);
 
-    let range = headers
+    let modified = metadata.modified().ok();
+    let etag = modified.map(|m| make_etag(file_size, m));
+    let last_modified = modified.and_then(format_http_date);
+
+    // RFC 7232: If-None-Match 优先，命中则 304；仅在 If-None-Match 缺失时才退到 If-Modified-Since。
+    let inm_header = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    if let (Some(raw), Some(tag)) = (inm_header, etag.as_deref()) {
+        if if_none_match_matches(raw, tag) {
+            return build_not_modified(etag.as_deref(), last_modified.as_deref());
+        }
+    } else if inm_header.is_none() {
+        let ims_header = headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok());
+        if let (Some(raw), Some(lm)) = (ims_header, last_modified.as_deref()) {
+            if raw.trim() == lm {
+                return build_not_modified(etag.as_deref(), last_modified.as_deref());
+            }
+        }
+    }
+
+    // RFC 7233: If-Range 不匹配时必须忽略 Range，退回 200 完整响应。
+    let if_range_ok = match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+        Some(raw) => if_range_matches(raw, etag.as_deref(), last_modified.as_deref()),
+        None => true,
+    };
+
+    let range_header = headers
         .get(header::RANGE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| parse_range_header(value, file_size))
-        .transpose()?;
+        .and_then(|value| value.to_str().ok());
+    let range = if if_range_ok {
+        match range_header.map(|value| parse_range_header(value, file_size)) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(_)) => {
+                return build_range_not_satisfiable(
+                    file_size,
+                    etag.as_deref(),
+                    last_modified.as_deref(),
+                );
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let mut file = fs::File::open(&resolved)
+        .await
+        .map_err(|err| ApiError::from_io(err, "file"))?;
 
     let (status, content_length, content_range_header) = match range {
         Some(value) => {
@@ -333,10 +377,49 @@ async fn serve_file_response(
     if let Some(content_range) = content_range_header {
         builder = builder.header(header::CONTENT_RANGE, content_range);
     }
+    if let Some(ref tag) = etag {
+        builder = builder.header(header::ETAG, tag);
+    }
+    if let Some(ref lm) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm);
+    }
 
     builder
         .body(body)
         .map_err(|_| ApiError::internal("Failed to build file response."))
+}
+
+fn build_not_modified(etag: Option<&str>, last_modified: Option<&str>) -> ApiResult<Response> {
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+    if let Some(tag) = etag {
+        builder = builder.header(header::ETAG, tag);
+    }
+    if let Some(lm) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm);
+    }
+    builder
+        .body(Body::empty())
+        .map_err(|_| ApiError::internal("Failed to build 304 response."))
+}
+
+fn build_range_not_satisfiable(
+    file_size: u64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> ApiResult<Response> {
+    let mut builder = Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(tag) = etag {
+        builder = builder.header(header::ETAG, tag);
+    }
+    if let Some(lm) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm);
+    }
+    builder
+        .body(Body::empty())
+        .map_err(|_| ApiError::internal("Failed to build 416 response."))
 }
 
 pub async fn login_handler(
@@ -578,6 +661,73 @@ fn to_hex_upper(nibble: u8) -> char {
     }
 }
 
+fn make_etag(size: u64, mtime: SystemTime) -> String {
+    let (sign, sec, nanos) = match mtime.duration_since(UNIX_EPOCH) {
+        Ok(d) => ('p', d.as_secs(), d.subsec_nanos()),
+        Err(err) => ('n', err.duration().as_secs(), err.duration().subsec_nanos()),
+    };
+    format!("W/\"{size:x}-{sign}{sec:x}.{nanos:x}\"")
+}
+
+fn format_http_date(t: SystemTime) -> Option<String> {
+    let dt = OffsetDateTime::from(t).to_offset(UtcOffset::UTC);
+    let weekday = match dt.weekday() {
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
+    };
+    let month = match dt.month() {
+        Month::January => "Jan",
+        Month::February => "Feb",
+        Month::March => "Mar",
+        Month::April => "Apr",
+        Month::May => "May",
+        Month::June => "Jun",
+        Month::July => "Jul",
+        Month::August => "Aug",
+        Month::September => "Sep",
+        Month::October => "Oct",
+        Month::November => "Nov",
+        Month::December => "Dec",
+    };
+    Some(format!(
+        "{weekday}, {day:02} {month} {year:04} {hour:02}:{minute:02}:{second:02} GMT",
+        day = dt.day(),
+        year = dt.year(),
+        hour = dt.hour(),
+        minute = dt.minute(),
+        second = dt.second(),
+    ))
+}
+
+fn if_none_match_matches(raw: &str, etag: &str) -> bool {
+    raw.split(',').any(|part| {
+        let part = part.trim();
+        part == "*" || weak_etag_equal(part, etag)
+    })
+}
+
+fn weak_etag_equal(a: &str, b: &str) -> bool {
+    strip_weak_prefix(a.trim()) == strip_weak_prefix(b.trim())
+}
+
+fn strip_weak_prefix(s: &str) -> &str {
+    s.strip_prefix("W/").unwrap_or(s)
+}
+
+fn if_range_matches(raw: &str, etag: Option<&str>, last_modified: Option<&str>) -> bool {
+    let raw = raw.trim();
+    if raw.starts_with('"') || raw.starts_with("W/") {
+        return etag.is_some_and(|e| weak_etag_equal(raw, e));
+    }
+    // 日期形式：RFC 7233 要求与我们发出的 Last-Modified 精确匹配
+    last_modified.is_some_and(|lm| raw == lm)
+}
+
 fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> {
     if file_size == 0 {
         return Err(ApiError::invalid_range(
@@ -648,10 +798,14 @@ fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> 
 mod tests {
     use std::net::IpAddr;
     use std::path::Path;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use axum::http::HeaderMap;
 
-    use super::{content_disposition_inline, parse_range_header, parse_x_forwarded_for};
+    use super::{
+        content_disposition_inline, format_http_date, if_none_match_matches, if_range_matches,
+        make_etag, parse_range_header, parse_x_forwarded_for,
+    };
 
     #[test]
     fn range_parses_open_ended() {
@@ -717,5 +871,58 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "unknown, garbage".parse().unwrap());
         assert!(parse_x_forwarded_for(&headers).is_none());
+    }
+
+    #[test]
+    fn etag_is_weak_and_encodes_size_and_mtime() {
+        let mtime = UNIX_EPOCH + Duration::from_secs(0x123);
+        let tag = make_etag(0x4a, mtime);
+        assert!(tag.starts_with("W/\""), "etag should be weak: {tag}");
+        assert!(tag.contains("4a-"), "etag should embed size: {tag}");
+        assert!(tag.contains("p123."), "etag should embed mtime: {tag}");
+    }
+
+    #[test]
+    fn http_date_format_is_imf_fixdate() {
+        let t = UNIX_EPOCH + Duration::from_secs(784_111_777);
+        let s = format_http_date(t).unwrap();
+        assert_eq!(s, "Sun, 06 Nov 1994 08:49:37 GMT");
+    }
+
+    #[test]
+    fn if_none_match_handles_star_and_weak() {
+        assert!(if_none_match_matches("*", "W/\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "W/\"abc\""));
+        assert!(if_none_match_matches("\"abc\"", "W/\"abc\""));
+        assert!(if_none_match_matches(
+            "\"xyz\", W/\"abc\" , \"foo\"",
+            "W/\"abc\""
+        ));
+        assert!(!if_none_match_matches("\"xyz\"", "W/\"abc\""));
+    }
+
+    #[test]
+    fn if_range_accepts_matching_etag() {
+        assert!(if_range_matches(
+            "W/\"abc\"",
+            Some("W/\"abc\""),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        ));
+        assert!(!if_range_matches(
+            "W/\"other\"",
+            Some("W/\"abc\""),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        ));
+    }
+
+    #[test]
+    fn if_range_accepts_matching_date() {
+        let lm = "Sun, 06 Nov 1994 08:49:37 GMT";
+        assert!(if_range_matches(lm, Some("W/\"abc\""), Some(lm)));
+        assert!(!if_range_matches(
+            "Mon, 07 Nov 1994 08:49:37 GMT",
+            Some("W/\"abc\""),
+            Some(lm),
+        ));
     }
 }

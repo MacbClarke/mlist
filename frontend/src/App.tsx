@@ -429,7 +429,7 @@ function App() {
       const url = toAbsoluteUrl(payload.url)
       await navigator.clipboard.writeText(url)
       await markFileHighlighted(entry.path)
-      toast.success("7 天播放链接已复制")
+      toast.success("已复制")
     } catch {
       toast.error("复制失败，请检查浏览器剪贴板权限。")
     }

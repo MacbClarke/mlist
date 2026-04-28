@@ -31,7 +31,6 @@ RUN apk add --no-cache ca-certificates tini \
 
 COPY --from=backend-builder /src/backend/target/release/backend /app/backend
 COPY --from=frontend-builder /src/frontend/dist /app/frontend-dist
-COPY backend/config.toml /app/config.toml
 
 RUN mkdir -p /mlist-files /mlist-data \
     && chown -R mlist:mlist /app /mlist-files /mlist-data

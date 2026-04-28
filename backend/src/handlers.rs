@@ -37,8 +37,6 @@ pub struct AppState {
     pub login_limiter: LoginRateLimiter,
 }
 
-const SIGNED_FILE_LINK_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
     pub path: Option<String>,
@@ -684,11 +682,7 @@ pub async fn login_handler(
 
     info!(ip = client_ip, user = user.username, "login succeeded");
 
-    let cookie = build_session_cookie(
-        &session_token,
-        state.config.session_ttl_seconds,
-        state.config.secure_cookies,
-    );
+    let cookie = build_session_cookie(&session_token, state.config.session_ttl_seconds);
     let updated_jar = jar.add(cookie);
 
     Ok((
@@ -745,11 +739,7 @@ pub async fn bootstrap_finish_handler(
     state.db.record_login(user.id).await?;
     info!(user = user.username, "bootstrap admin created");
 
-    let cookie = build_session_cookie(
-        &session_token,
-        state.config.session_ttl_seconds,
-        state.config.secure_cookies,
-    );
+    let cookie = build_session_cookie(&session_token, state.config.session_ttl_seconds);
     let updated_jar = jar.add(cookie);
 
     Ok((
@@ -907,7 +897,12 @@ pub async fn create_file_link_handler(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let expires_at = state
         .db
-        .create_signed_file_token(session.user.id, &path, &token, SIGNED_FILE_LINK_TTL_SECONDS)
+        .create_signed_file_token(
+            session.user.id,
+            &path,
+            &token,
+            state.config.signed_file_link_ttl_seconds,
+        )
         .await?;
 
     Ok(Json(SignedFileLinkResponse {
@@ -971,22 +966,13 @@ fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
         .or_else(|| raw.parse::<SocketAddr>().ok().map(|value| value.ip()))
 }
 
-fn build_session_cookie(
-    session_id: &str,
-    ttl_seconds: u64,
-    secure_cookie: bool,
-) -> Cookie<'static> {
-    let mut builder = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+fn build_session_cookie(session_id: &str, ttl_seconds: u64) -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
-        .max_age(time::Duration::seconds(ttl_seconds as i64));
-
-    if secure_cookie {
-        builder = builder.secure(true);
-    }
-
-    builder.build()
+        .max_age(time::Duration::seconds(ttl_seconds as i64))
+        .build()
 }
 
 async fn current_session(state: &AppState, jar: &CookieJar) -> ApiResult<Option<AuthSession>> {

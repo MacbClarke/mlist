@@ -14,7 +14,6 @@ sha2 = "0.10.9"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1.44.0", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["io"] }
-toml = "0.8.20"
 totp-rs = { version = "5.7.1", features = ["gen_secret", "qr"] }
 tower-http = { version = "0.6.2", features = ["fs", "set-header", "trace"] }
 tracing = "0.1.41"

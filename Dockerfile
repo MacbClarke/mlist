@@ -25,7 +25,7 @@ FROM alpine:3.21 AS runtime
 ENV RUST_LOG=backend=info,tower_http=info
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates tini \
     && addgroup -S mlist \
     && adduser -S -u 10001 -G mlist mlist
 
@@ -40,4 +40,5 @@ USER mlist
 
 VOLUME ["/mlist-data"]
 EXPOSE 3000
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["./backend"]

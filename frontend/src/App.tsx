@@ -254,11 +254,11 @@ function App() {
       const me = await fetchMe()
       applyMe(me)
       if (me.authenticated && me.user) {
+        await loadHighlightedFilesFromServer()
         if (isAdminPath(window.location.pathname)) {
           setAdminRoute(true)
         } else {
           await loadPath(pathFromLocation(window.location.pathname), { replaceUrl: true })
-          await loadHighlightedFilesFromServer()
         }
       }
     } catch (err) {

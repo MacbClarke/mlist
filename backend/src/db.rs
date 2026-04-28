@@ -120,6 +120,27 @@ impl ResourceKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTransferState {
+    Active,
+    Completed,
+    Aborted,
+    Failed,
+    Stale,
+}
+
+impl ResourceTransferState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordResourceAccess {
     pub user_id: i64,
@@ -147,7 +168,10 @@ pub struct ResourceAccessEventView {
     pub file_size: Option<i64>,
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
+    pub transfer_state: String,
     pub created_at: i64,
+    pub updated_at: i64,
+    pub ended_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +222,9 @@ impl AuthDb {
 
         let db = Self { pool };
         db.migrate()
+            .await
+            .map_err(|err| format!("Failed to initialize database: {err}"))?;
+        db.mark_active_resource_accesses_stale()
             .await
             .map_err(|err| format!("Failed to initialize database: {err}"))?;
         Ok(db)
@@ -282,9 +309,36 @@ impl AuthDb {
                 file_size INTEGER,
                 range_start INTEGER,
                 range_end INTEGER,
-                created_at INTEGER NOT NULL
+                transfer_state TEXT NOT NULL DEFAULT 'completed' CHECK (transfer_state IN ('active', 'completed', 'aborted', 'failed', 'stale')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                ended_at INTEGER
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        self.ensure_column(
+            "resource_access_events",
+            "transfer_state",
+            "TEXT NOT NULL DEFAULT 'completed' CHECK (transfer_state IN ('active', 'completed', 'aborted', 'failed', 'stale'))",
+        )
+        .await?;
+        self.ensure_column(
+            "resource_access_events",
+            "updated_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        self.ensure_column("resource_access_events", "ended_at", "INTEGER")
+            .await?;
+        sqlx::query(
+            "UPDATE resource_access_events SET updated_at = created_at WHERE updated_at = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE resource_access_events SET ended_at = created_at WHERE ended_at IS NULL AND transfer_state = 'completed'",
         )
         .execute(&self.pool)
         .await?;
@@ -309,7 +363,17 @@ impl AuthDb {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE INDEX IF NOT EXISTS resource_access_events_updated_idx ON resource_access_events(updated_at DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS resource_access_events_user_created_idx ON resource_access_events(user_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS resource_access_events_user_updated_idx ON resource_access_events(user_id, updated_at DESC, id DESC)",
         )
         .execute(&self.pool)
         .await?;
@@ -350,6 +414,23 @@ impl AuthDb {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
             sqlx::query(&sql).execute(&self.pool).await?;
         }
+        Ok(())
+    }
+
+    async fn mark_active_resource_accesses_stale(&self) -> sqlx::Result<()> {
+        let now = now_unix() as i64;
+        sqlx::query(
+            r#"
+            UPDATE resource_access_events
+            SET transfer_state = ?1, updated_at = ?2, ended_at = ?2
+            WHERE transfer_state = ?3
+            "#,
+        )
+        .bind(ResourceTransferState::Stale.as_str())
+        .bind(now)
+        .bind(ResourceTransferState::Active.as_str())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -658,14 +739,16 @@ impl AuthDb {
         let now = now_unix() as i64;
         let cutoff = now.saturating_sub(90 * 24 * 60 * 60);
         let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let bytes_served = access.bytes_served.max(0);
 
         sqlx::query(
             r#"
             INSERT INTO resource_access_events (
                 user_id, resource_kind, path, route, status, bytes_served,
-                file_size, range_start, range_end, created_at
+                file_size, range_start, range_end, transfer_state, created_at,
+                updated_at, ended_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
             "#,
         )
         .bind(access.user_id)
@@ -673,10 +756,11 @@ impl AuthDb {
         .bind(&access.path)
         .bind(access.route)
         .bind(i64::from(access.status))
-        .bind(access.bytes_served)
+        .bind(bytes_served)
         .bind(access.file_size)
         .bind(access.range_start)
         .bind(access.range_end)
+        .bind(ResourceTransferState::Completed.as_str())
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -690,26 +774,15 @@ impl AuthDb {
             .map_err(db_error)?;
 
         if matches!(access.kind, ResourceKind::File) {
-            sqlx::query(
-                r#"
-                INSERT INTO user_resource_usage (
-                    user_id, path, file_size, access_count, total_bytes_served,
-                    last_access_at
-                )
-                VALUES (?1, ?2, ?3, 1, ?4, ?5)
-                ON CONFLICT(user_id, path) DO UPDATE SET
-                    file_size = excluded.file_size,
-                    access_count = user_resource_usage.access_count + 1,
-                    total_bytes_served = user_resource_usage.total_bytes_served + excluded.total_bytes_served,
-                    last_access_at = excluded.last_access_at
-                "#,
+            upsert_resource_usage_delta(
+                &mut tx,
+                access.user_id,
+                &access.path,
+                access.file_size,
+                1,
+                bytes_served,
+                now,
             )
-            .bind(access.user_id)
-            .bind(&access.path)
-            .bind(access.file_size)
-            .bind(access.bytes_served)
-            .bind(now)
-            .execute(&mut *tx)
             .await
             .map_err(db_error)?;
         }
@@ -719,6 +792,210 @@ impl AuthDb {
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
+
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+
+    pub async fn start_resource_stream_access(
+        &self,
+        access: RecordResourceAccess,
+    ) -> ApiResult<i64> {
+        if !matches!(access.kind, ResourceKind::File) {
+            return Err(ApiError::internal(
+                "Streaming resource access must reference a file.",
+            ));
+        }
+
+        let now = now_unix() as i64;
+        let cutoff = now.saturating_sub(90 * 24 * 60 * 60);
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO resource_access_events (
+                user_id, resource_kind, path, route, status, bytes_served,
+                file_size, range_start, range_end, transfer_state, created_at,
+                updated_at, ended_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?10, NULL)
+            "#,
+        )
+        .bind(access.user_id)
+        .bind(access.kind.as_str())
+        .bind(&access.path)
+        .bind(access.route)
+        .bind(i64::from(access.status))
+        .bind(access.file_size)
+        .bind(access.range_start)
+        .bind(access.range_end)
+        .bind(ResourceTransferState::Active.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let event_id = result.last_insert_rowid();
+
+        sqlx::query("UPDATE users SET last_seen_at = ?1, updated_at = ?1 WHERE id = ?2")
+            .bind(now)
+            .bind(access.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+
+        upsert_resource_usage_delta(
+            &mut tx,
+            access.user_id,
+            &access.path,
+            access.file_size,
+            1,
+            0,
+            now,
+        )
+        .await
+        .map_err(db_error)?;
+
+        sqlx::query("DELETE FROM resource_access_events WHERE created_at < ?1")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+
+        tx.commit().await.map_err(db_error)?;
+        Ok(event_id)
+    }
+
+    pub async fn update_resource_stream_progress(
+        &self,
+        event_id: i64,
+        bytes_served: i64,
+    ) -> ApiResult<()> {
+        let now = now_unix() as i64;
+        let requested_total = bytes_served.max(0);
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT user_id, resource_kind, path, file_size, bytes_served, transfer_state
+            FROM resource_access_events
+            WHERE id = ?1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?
+        else {
+            return Err(ApiError::internal("Resource access event was not found."));
+        };
+
+        let transfer_state: String = row.get("transfer_state");
+        if transfer_state != ResourceTransferState::Active.as_str() {
+            tx.commit().await.map_err(db_error)?;
+            return Ok(());
+        }
+
+        let current_total = row.get::<i64, _>("bytes_served").max(0);
+        let new_total = requested_total.max(current_total);
+        let delta = new_total.saturating_sub(current_total);
+        if delta == 0 {
+            tx.commit().await.map_err(db_error)?;
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE resource_access_events
+            SET bytes_served = ?1, updated_at = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind(new_total)
+        .bind(now)
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        let resource_kind: String = row.get("resource_kind");
+        if resource_kind == ResourceKind::File.as_str() {
+            let user_id = row.get("user_id");
+            let path: String = row.get("path");
+            let file_size = row.get("file_size");
+            upsert_resource_usage_delta(&mut tx, user_id, &path, file_size, 0, delta, now)
+                .await
+                .map_err(db_error)?;
+        }
+
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+
+    pub async fn finish_resource_stream_access(
+        &self,
+        event_id: i64,
+        transfer_state: ResourceTransferState,
+        bytes_served: i64,
+    ) -> ApiResult<()> {
+        if transfer_state == ResourceTransferState::Active {
+            return Err(ApiError::internal(
+                "Finished stream cannot use the active transfer state.",
+            ));
+        }
+
+        let now = now_unix() as i64;
+        let requested_total = bytes_served.max(0);
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT user_id, resource_kind, path, file_size, bytes_served, transfer_state
+            FROM resource_access_events
+            WHERE id = ?1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?
+        else {
+            return Err(ApiError::internal("Resource access event was not found."));
+        };
+
+        let current_state: String = row.get("transfer_state");
+        if current_state != ResourceTransferState::Active.as_str() {
+            tx.commit().await.map_err(db_error)?;
+            return Ok(());
+        }
+
+        let current_total = row.get::<i64, _>("bytes_served").max(0);
+        let new_total = requested_total.max(current_total);
+        let delta = new_total.saturating_sub(current_total);
+
+        sqlx::query(
+            r#"
+            UPDATE resource_access_events
+            SET bytes_served = ?1, transfer_state = ?2, updated_at = ?3, ended_at = ?3
+            WHERE id = ?4
+            "#,
+        )
+        .bind(new_total)
+        .bind(transfer_state.as_str())
+        .bind(now)
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        let resource_kind: String = row.get("resource_kind");
+        if resource_kind == ResourceKind::File.as_str() {
+            let user_id = row.get("user_id");
+            let path: String = row.get("path");
+            let file_size = row.get("file_size");
+            upsert_resource_usage_delta(&mut tx, user_id, &path, file_size, 0, delta, now)
+                .await
+                .map_err(db_error)?;
+        }
 
         tx.commit().await.map_err(db_error)?;
         Ok(())
@@ -737,11 +1014,12 @@ impl AuthDb {
                 r#"
                 SELECT
                     e.id, e.user_id, u.username, e.resource_kind, e.path, e.route,
-                    e.status, e.bytes_served, e.file_size, e.range_start, e.range_end, e.created_at
+                    e.status, e.bytes_served, e.file_size, e.range_start, e.range_end,
+                    e.transfer_state, e.created_at, e.updated_at, e.ended_at
                 FROM resource_access_events e
                 JOIN users u ON u.id = e.user_id
                 WHERE e.user_id = ?1
-                ORDER BY e.created_at DESC, e.id DESC
+                ORDER BY e.updated_at DESC, e.id DESC
                 LIMIT ?2
                 OFFSET ?3
                 "#,
@@ -757,10 +1035,11 @@ impl AuthDb {
                 r#"
                 SELECT
                     e.id, e.user_id, u.username, e.resource_kind, e.path, e.route,
-                    e.status, e.bytes_served, e.file_size, e.range_start, e.range_end, e.created_at
+                    e.status, e.bytes_served, e.file_size, e.range_start, e.range_end,
+                    e.transfer_state, e.created_at, e.updated_at, e.ended_at
                 FROM resource_access_events e
                 JOIN users u ON u.id = e.user_id
-                ORDER BY e.created_at DESC, e.id DESC
+                ORDER BY e.updated_at DESC, e.id DESC
                 LIMIT ?1
                 OFFSET ?2
                 "#,
@@ -996,6 +1275,40 @@ impl AuthDb {
     }
 }
 
+async fn upsert_resource_usage_delta(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: i64,
+    path: &str,
+    file_size: Option<i64>,
+    access_count_delta: i64,
+    bytes_delta: i64,
+    last_access_at: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO user_resource_usage (
+            user_id, path, file_size, access_count, total_bytes_served,
+            last_access_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(user_id, path) DO UPDATE SET
+            file_size = excluded.file_size,
+            access_count = user_resource_usage.access_count + excluded.access_count,
+            total_bytes_served = user_resource_usage.total_bytes_served + excluded.total_bytes_served,
+            last_access_at = excluded.last_access_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(path)
+    .bind(file_size)
+    .bind(access_count_delta.max(0))
+    .bind(bytes_delta.max(0))
+    .bind(last_access_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn fetch_user_by_id_from(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: i64,
@@ -1074,7 +1387,10 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> ResourceAccessEventView {
         file_size: row.get("file_size"),
         range_start: row.get("range_start"),
         range_end: row.get("range_end"),
+        transfer_state: row.get("transfer_state"),
         created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        ended_at: row.get("ended_at"),
     }
 }
 
@@ -1133,7 +1449,9 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AuthDb, RecordResourceAccess, ResourceKind, UserRole};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    use super::{AuthDb, RecordResourceAccess, ResourceKind, ResourceTransferState, UserRole};
 
     fn test_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1218,6 +1536,9 @@ mod tests {
         let events = db.list_access_events_page(None, 10, 0).await.unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].path, "movies/demo.mp4");
+        assert_eq!(events[0].transfer_state, "completed");
+        assert_eq!(events[0].updated_at, events[0].created_at);
+        assert_eq!(events[0].ended_at, Some(events[0].created_at));
 
         let usage = db
             .list_resource_usage_page(Some(user.id), 10, 0)
@@ -1226,6 +1547,180 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].access_count, 3);
         assert_eq!(usage[0].total_bytes_served, 200);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn resource_access_migrates_legacy_events_to_completed() {
+        let path = test_db_path("audit-migration");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+                totp_secret TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_login_at INTEGER,
+                last_seen_at INTEGER
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, username, role, totp_secret, enabled, created_at, updated_at
+            )
+            VALUES (1, 'legacy', 'user', 'SECRET', 1, 100, 100)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE resource_access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                resource_kind TEXT NOT NULL CHECK (resource_kind IN ('directory', 'file')),
+                path TEXT NOT NULL,
+                route TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                bytes_served INTEGER NOT NULL DEFAULT 0,
+                file_size INTEGER,
+                range_start INTEGER,
+                range_end INTEGER,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO resource_access_events (
+                user_id, resource_kind, path, route, status, bytes_served,
+                file_size, range_start, range_end, created_at
+            )
+            VALUES (1, 'file', 'old.bin', '/d', 200, 12, 12, NULL, NULL, 1234)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = AuthDb::connect(&path).await.unwrap();
+        let events = db.list_access_events_page(None, 10, 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].transfer_state, "completed");
+        assert_eq!(events[0].updated_at, events[0].created_at);
+        assert_eq!(events[0].ended_at, Some(events[0].created_at));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stream_access_progress_and_finish_accumulate_deltas() {
+        let path = test_db_path("stream-audit");
+        let db = AuthDb::connect(&path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+
+        let event_id = db
+            .start_resource_stream_access(RecordResourceAccess {
+                user_id: user.id,
+                kind: ResourceKind::File,
+                path: "movies/demo.mp4".to_string(),
+                route: "/d",
+                status: 200,
+                bytes_served: 0,
+                file_size: Some(1_000),
+                range_start: None,
+                range_end: None,
+            })
+            .await
+            .unwrap();
+
+        db.update_resource_stream_progress(event_id, 40)
+            .await
+            .unwrap();
+        db.update_resource_stream_progress(event_id, 70)
+            .await
+            .unwrap();
+        db.finish_resource_stream_access(event_id, ResourceTransferState::Completed, 100)
+            .await
+            .unwrap();
+
+        let events = db
+            .list_access_events_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bytes_served, 100);
+        assert_eq!(events[0].transfer_state, "completed");
+        assert!(events[0].ended_at.is_some());
+
+        let usage = db
+            .list_resource_usage_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].access_count, 1);
+        assert_eq!(usage[0].total_bytes_served, 100);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_marks_leftover_active_events_stale() {
+        let path = test_db_path("stream-stale");
+        let db = AuthDb::connect(&path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+        db.start_resource_stream_access(RecordResourceAccess {
+            user_id: user.id,
+            kind: ResourceKind::File,
+            path: "movies/demo.mp4".to_string(),
+            route: "/d",
+            status: 200,
+            bytes_served: 0,
+            file_size: Some(1_000),
+            range_start: None,
+            range_end: None,
+        })
+        .await
+        .unwrap();
+        drop(db);
+
+        let db = AuthDb::connect(&path).await.unwrap();
+        let events = db
+            .list_access_events_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].transfer_state, "stale");
+        assert!(events[0].ended_at.is_some());
 
         let _ = std::fs::remove_file(path);
     }

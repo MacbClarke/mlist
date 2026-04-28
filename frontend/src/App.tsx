@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { FormEvent, ReactNode } from "react"
 import {
   AlertCircleIcon,
@@ -151,8 +151,13 @@ type ResourceAccessEvent = {
   fileSize?: number | null
   rangeStart?: number | null
   rangeEnd?: number | null
+  transferState: TransferState
   createdAt: number
+  updatedAt: number
+  endedAt?: number | null
 }
+
+type TransferState = "active" | "completed" | "aborted" | "failed" | "stale"
 
 type ResourceUsage = {
   userId: number
@@ -1141,48 +1146,80 @@ function AuditView({
   const [resourcesHasMore, setResourcesHasMore] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
+  const auditRequestRef = useRef(0)
+  const auditInFlightRef = useRef(0)
+
+  const loadAudit = useCallback(
+    async (showLoading = true, skipIfBusy = false) => {
+      if (skipIfBusy && auditInFlightRef.current > 0) return
+      auditInFlightRef.current += 1
+      const requestId = auditRequestRef.current + 1
+      auditRequestRef.current = requestId
+      if (showLoading) {
+        setLoading(true)
+      }
+      setError("")
+      try {
+        const baseQuery = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE) })
+        if (selectedUserId !== "all") {
+          baseQuery.set("userId", selectedUserId)
+        }
+        const eventsQuery = new URLSearchParams(baseQuery)
+        eventsQuery.set("offset", String(eventsPage * AUDIT_PAGE_SIZE))
+        const resourcesQuery = new URLSearchParams(baseQuery)
+        resourcesQuery.set("offset", String(resourcesPage * AUDIT_PAGE_SIZE))
+        const [eventsPayload, resourcesPayload] = await Promise.all([
+          apiJson<AuditEventsResponse>(`/api/admin/audit/events?${eventsQuery}`),
+          apiJson<AuditResourcesResponse>(`/api/admin/audit/resources?${resourcesQuery}`),
+        ])
+        if (auditRequestRef.current !== requestId) return
+        setEvents(eventsPayload.events)
+        setResources(resourcesPayload.resources)
+        setEventsHasMore(eventsPayload.hasMore)
+        setResourcesHasMore(resourcesPayload.hasMore)
+      } catch (err) {
+        if (auditRequestRef.current === requestId) {
+          setError(err instanceof Error ? err.message : "审计数据加载失败")
+        }
+      } finally {
+        if (showLoading && auditRequestRef.current === requestId) {
+          setLoading(false)
+        }
+        auditInFlightRef.current = Math.max(0, auditInFlightRef.current - 1)
+      }
+    },
+    [eventsPage, resourcesPage, selectedUserId],
+  )
 
   useEffect(() => {
+    let cancelled = false
+    let timer: number | undefined
+
+    async function loadAndSchedule(showLoading: boolean) {
+      await loadAudit(showLoading, !showLoading)
+      if (cancelled) return
+      timer = window.setTimeout(() => void loadAndSchedule(false), 5000)
+    }
+
+    void loadAndSchedule(true)
+    return () => {
+      cancelled = true
+      if (timer !== undefined) {
+        window.clearTimeout(timer)
+      }
+    }
+  }, [loadAudit])
+
+  function handleUserChange(value: string) {
     setEventsPage(0)
     setResourcesPage(0)
-  }, [selectedUserId])
-
-  useEffect(() => {
-    void loadAudit()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedUserId, eventsPage, resourcesPage])
-
-  async function loadAudit() {
-    setLoading(true)
-    setError("")
-    try {
-      const baseQuery = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE) })
-      if (selectedUserId !== "all") {
-        baseQuery.set("userId", selectedUserId)
-      }
-      const eventsQuery = new URLSearchParams(baseQuery)
-      eventsQuery.set("offset", String(eventsPage * AUDIT_PAGE_SIZE))
-      const resourcesQuery = new URLSearchParams(baseQuery)
-      resourcesQuery.set("offset", String(resourcesPage * AUDIT_PAGE_SIZE))
-      const [eventsPayload, resourcesPayload] = await Promise.all([
-        apiJson<AuditEventsResponse>(`/api/admin/audit/events?${eventsQuery}`),
-        apiJson<AuditResourcesResponse>(`/api/admin/audit/resources?${resourcesQuery}`),
-      ])
-      setEvents(eventsPayload.events)
-      setResources(resourcesPayload.resources)
-      setEventsHasMore(eventsPayload.hasMore)
-      setResourcesHasMore(resourcesPayload.hasMore)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "审计数据加载失败")
-    } finally {
-      setLoading(false)
-    }
+    onUserChange(value)
   }
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Select value={selectedUserId} onValueChange={onUserChange}>
+        <Select value={selectedUserId} onValueChange={handleUserChange}>
           <SelectTrigger className="w-full sm:w-56">
             <SelectValue placeholder="选择用户" />
           </SelectTrigger>
@@ -1248,15 +1285,16 @@ function AuditView({
               onPageChange={setEventsPage}
             />
           </div>
-          <CardDescription>最近 90 天内成功访问的目录和文件。</CardDescription>
+          <CardDescription>最近 90 天内的目录、文件和进行中拉流。</CardDescription>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>时间</TableHead>
+                <TableHead>更新时间</TableHead>
                 <TableHead>用户</TableHead>
                 <TableHead>类型</TableHead>
+                <TableHead>状态</TableHead>
                 <TableHead>路径</TableHead>
                 <TableHead className="hidden md:table-cell">Range</TableHead>
                 <TableHead className="text-right">流量</TableHead>
@@ -1265,13 +1303,13 @@ function AuditView({
             <TableBody>
               {loading && events.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
+                  <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
                     正在加载访问记录...
                   </TableCell>
                 </TableRow>
               ) : events.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
+                  <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
                     暂无访问记录
                   </TableCell>
                 </TableRow>
@@ -1279,13 +1317,16 @@ function AuditView({
                 events.map((event) => (
                   <TableRow key={event.id}>
                     <TableCell className="text-muted-foreground whitespace-nowrap">
-                      {formatDate(event.createdAt)}
+                      {formatDate(event.updatedAt)}
                     </TableCell>
                     <TableCell>{event.username}</TableCell>
                     <TableCell>
                       <Badge variant="outline">
                         {event.resourceKind === "file" ? "文件" : "目录"}
                       </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <TransferStateBadge event={event} />
                     </TableCell>
                     <TableCell className="max-w-[22rem] truncate font-mono text-xs">
                       {event.path || "/"}
@@ -1304,6 +1345,56 @@ function AuditView({
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+function TransferStateBadge({ event }: { event: ResourceAccessEvent }) {
+  const endedAt = event.endedAt ? `结束：${formatDate(event.endedAt)}` : "尚未结束"
+  if (event.transferState === "active") {
+    return (
+      <Badge
+        variant="outline"
+        className="border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300"
+        title={endedAt}
+      >
+        <ActivityIcon className="size-3" />
+        进行中
+      </Badge>
+    )
+  }
+  if (event.transferState === "aborted") {
+    return (
+      <Badge
+        variant="outline"
+        className="border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300"
+        title={endedAt}
+      >
+        <CircleOffIcon className="size-3" />
+        已中断
+      </Badge>
+    )
+  }
+  if (event.transferState === "failed") {
+    return (
+      <Badge variant="destructive" title={endedAt}>
+        <AlertCircleIcon className="size-3" />
+        失败
+      </Badge>
+    )
+  }
+  if (event.transferState === "stale") {
+    return (
+      <Badge variant="secondary" title={endedAt}>
+        <CircleOffIcon className="size-3" />
+        失联
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="secondary" title={endedAt}>
+      <CheckCircleIcon className="size-3" />
+      完成
+    </Badge>
   )
 }
 

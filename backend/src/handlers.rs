@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use time::{Month, OffsetDateTime, UtcOffset, Weekday};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{error, info};
@@ -26,7 +26,7 @@ use crate::auth::{find_private_anchor, has_private_hide_marker};
 use crate::config::AppConfig;
 use crate::db::{
     AuthDb, AuthSession, RecordResourceAccess, ResourceAccessEventView, ResourceKind,
-    ResourceUsageView, UserFileStateView, UserRole, UserRoleInput, UserView,
+    ResourceTransferState, ResourceUsageView, UserFileStateView, UserRole, UserRoleInput, UserView,
 };
 use crate::errors::{ApiError, ApiResult};
 use crate::path_guard::{
@@ -494,9 +494,9 @@ async fn serve_file_response(
         Some(value) => file.take(value.len()),
         None => file.take(file_size),
     };
-    let recorder = FileAccessRecorder::new(
-        state.db.clone(),
-        RecordResourceAccess {
+    let event_id = state
+        .db
+        .start_resource_stream_access(RecordResourceAccess {
             user_id: session.user.id,
             kind: ResourceKind::File,
             path: relative_path.clone(),
@@ -506,8 +506,9 @@ async fn serve_file_response(
             file_size: Some(u64_to_i64(file_size)),
             range_start: range.map(|value| u64_to_i64(value.start)),
             range_end: range.map(|value| u64_to_i64(value.end)),
-        },
-    );
+        })
+        .await?;
+    let recorder = FileAccessRecorder::new(state.db.clone(), event_id);
     let stream = CountingFileStream::new(reader, recorder);
     let body = Body::from_stream(stream);
 
@@ -535,48 +536,94 @@ async fn serve_file_response(
 
 struct FileAccessRecorder {
     db: AuthDb,
-    access: RecordResourceAccess,
+    event_id: i64,
     bytes_served: AtomicU64,
-    recorded: AtomicBool,
+    last_progress_at: AtomicI64,
+    finalized: AtomicBool,
 }
 
+const STREAM_PROGRESS_FLUSH_INTERVAL_SECONDS: i64 = 5;
+
 impl FileAccessRecorder {
-    fn new(db: AuthDb, access: RecordResourceAccess) -> Arc<Self> {
+    fn new(db: AuthDb, event_id: i64) -> Arc<Self> {
         Arc::new(Self {
             db,
-            access,
+            event_id,
             bytes_served: AtomicU64::new(0),
-            recorded: AtomicBool::new(false),
+            last_progress_at: AtomicI64::new(now_unix() as i64),
+            finalized: AtomicBool::new(false),
         })
     }
 
-    fn add_bytes(&self, len: usize) {
-        self.bytes_served
-            .fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
+    fn add_bytes(self: &Arc<Self>, len: usize) {
+        let added = u64::try_from(len).unwrap_or(u64::MAX);
+        let _ = self
+            .bytes_served
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(added))
+            });
+        self.maybe_flush_progress();
     }
 
-    fn finalize_in_background(self: Arc<Self>) {
-        if self.recorded.swap(true, Ordering::AcqRel) {
+    fn maybe_flush_progress(self: &Arc<Self>) {
+        if self.finalized.load(Ordering::Acquire) {
+            return;
+        }
+
+        let now = now_unix() as i64;
+        let previous = self.last_progress_at.load(Ordering::Acquire);
+        if now.saturating_sub(previous) < STREAM_PROGRESS_FLUSH_INTERVAL_SECONDS {
+            return;
+        }
+        if self
+            .last_progress_at
+            .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let recorder = Arc::clone(self);
+        tokio::spawn(async move {
+            let bytes_served = u64_to_i64(recorder.bytes_served.load(Ordering::Acquire));
+            if let Err(err) = recorder
+                .db
+                .update_resource_stream_progress(recorder.event_id, bytes_served)
+                .await
+            {
+                error!("failed to update file stream progress: {err:?}");
+            }
+        });
+    }
+
+    fn finalize_in_background(self: Arc<Self>, transfer_state: ResourceTransferState) {
+        if self.finalized.swap(true, Ordering::AcqRel) {
             return;
         }
 
         tokio::spawn(async move {
-            let mut access = self.access.clone();
-            access.bytes_served = u64_to_i64(self.bytes_served.load(Ordering::Acquire));
-            if let Err(err) = self.db.record_resource_access(access).await {
-                error!("failed to record file access: {err:?}");
+            let bytes_served = u64_to_i64(self.bytes_served.load(Ordering::Acquire));
+            if let Err(err) = self
+                .db
+                .finish_resource_stream_access(self.event_id, transfer_state, bytes_served)
+                .await
+            {
+                error!("failed to finalize file stream access: {err:?}");
             }
         });
     }
 }
 
-struct CountingFileStream {
-    inner: Pin<Box<ReaderStream<tokio::io::Take<fs::File>>>>,
+struct CountingFileStream<R> {
+    inner: Pin<Box<ReaderStream<R>>>,
     recorder: Arc<FileAccessRecorder>,
 }
 
-impl CountingFileStream {
-    fn new(reader: tokio::io::Take<fs::File>, recorder: Arc<FileAccessRecorder>) -> Self {
+impl<R> CountingFileStream<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn new(reader: R, recorder: Arc<FileAccessRecorder>) -> Self {
         Self {
             inner: Box::pin(ReaderStream::new(reader)),
             recorder,
@@ -584,7 +631,10 @@ impl CountingFileStream {
     }
 }
 
-impl Stream for CountingFileStream {
+impl<R> Stream for CountingFileStream<R>
+where
+    R: AsyncRead + Unpin,
+{
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -594,11 +644,15 @@ impl Stream for CountingFileStream {
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(err))) => {
-                self.recorder.clone().finalize_in_background();
+                self.recorder
+                    .clone()
+                    .finalize_in_background(ResourceTransferState::Failed);
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
-                self.recorder.clone().finalize_in_background();
+                self.recorder
+                    .clone()
+                    .finalize_in_background(ResourceTransferState::Completed);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -606,9 +660,11 @@ impl Stream for CountingFileStream {
     }
 }
 
-impl Drop for CountingFileStream {
+impl<R> Drop for CountingFileStream<R> {
     fn drop(&mut self) {
-        self.recorder.clone().finalize_in_background();
+        self.recorder
+            .clone()
+            .finalize_in_background(ResourceTransferState::Aborted);
     }
 }
 
@@ -1423,13 +1479,16 @@ fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> 
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::net::IpAddr;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::{Duration, UNIX_EPOCH};
 
     use axum::http::HeaderMap;
     use futures_util::StreamExt;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
     use crate::db::{AuthDb, RecordResourceAccess, ResourceKind, UserRole};
 
@@ -1445,6 +1504,18 @@ mod tests {
             uuid::Uuid::new_v4().simple(),
             extension
         ))
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("read failed")))
+        }
     }
 
     #[test]
@@ -1509,9 +1580,8 @@ mod tests {
         tokio::fs::write(&file_path, &data).await.unwrap();
 
         let file = tokio::fs::File::open(&file_path).await.unwrap();
-        let recorder = FileAccessRecorder::new(
-            db.clone(),
-            RecordResourceAccess {
+        let event_id = db
+            .start_resource_stream_access(RecordResourceAccess {
                 user_id: user.id,
                 kind: ResourceKind::File,
                 path: "movie.bin".to_string(),
@@ -1521,8 +1591,10 @@ mod tests {
                 file_size: Some(data.len() as i64),
                 range_start: Some(0),
                 range_end: Some(data.len() as i64 - 1),
-            },
-        );
+            })
+            .await
+            .unwrap();
+        let recorder = FileAccessRecorder::new(db.clone(), event_id);
         let mut stream = CountingFileStream::new(file.take(data.len() as u64), recorder);
         let first_chunk_len = stream.next().await.unwrap().unwrap().len();
         assert!(first_chunk_len < data.len());
@@ -1542,9 +1614,98 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].bytes_served, first_chunk_len as i64);
+        assert_eq!(events[0].transfer_state, "aborted");
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_marks_completed_after_full_consumption() {
+        let db_path = test_path("counting-stream-complete", "sqlite3");
+        let file_path = test_path("counting-stream-complete-file", "bin");
+        let db = AuthDb::connect(&db_path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+        let data = vec![9_u8; 64 * 1024];
+        tokio::fs::write(&file_path, &data).await.unwrap();
+
+        let file = tokio::fs::File::open(&file_path).await.unwrap();
+        let event_id = db
+            .start_resource_stream_access(RecordResourceAccess {
+                user_id: user.id,
+                kind: ResourceKind::File,
+                path: "movie.bin".to_string(),
+                route: "/d",
+                status: 200,
+                bytes_served: 0,
+                file_size: Some(data.len() as i64),
+                range_start: None,
+                range_end: None,
+            })
+            .await
+            .unwrap();
+        let recorder = FileAccessRecorder::new(db.clone(), event_id);
+        let mut stream = CountingFileStream::new(file.take(data.len() as u64), recorder);
+        let mut total = 0;
+        while let Some(chunk) = stream.next().await {
+            total += chunk.unwrap().len();
+        }
+        assert_eq!(total, data.len());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = db
+            .list_access_events_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bytes_served, data.len() as i64);
+        assert_eq!(events[0].transfer_state, "completed");
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_marks_failed_on_read_error() {
+        let db_path = test_path("counting-stream-failed", "sqlite3");
+        let db = AuthDb::connect(&db_path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+
+        let event_id = db
+            .start_resource_stream_access(RecordResourceAccess {
+                user_id: user.id,
+                kind: ResourceKind::File,
+                path: "movie.bin".to_string(),
+                route: "/d",
+                status: 200,
+                bytes_served: 0,
+                file_size: Some(128),
+                range_start: None,
+                range_end: None,
+            })
+            .await
+            .unwrap();
+        let recorder = FileAccessRecorder::new(db.clone(), event_id);
+        let mut stream = CountingFileStream::new(FailingReader, recorder);
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = db
+            .list_access_events_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bytes_served, 0);
+        assert_eq!(events[0].transfer_state, "failed");
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]

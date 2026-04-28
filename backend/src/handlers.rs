@@ -1,22 +1,26 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use time::{Month, OffsetDateTime, UtcOffset, Weekday};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::auth::{find_private_anchor, has_private_hide_marker};
 use crate::config::AppConfig;
@@ -52,6 +56,7 @@ pub struct DirectFileQuery {
 pub struct AuditQuery {
     pub user_id: Option<i64>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,12 +175,14 @@ pub struct UsersResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AuditEventsResponse {
     pub events: Vec<ResourceAccessEventView>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditResourcesResponse {
     pub resources: Vec<ResourceUsageView>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -487,7 +494,21 @@ async fn serve_file_response(
         Some(value) => file.take(value.len()),
         None => file.take(file_size),
     };
-    let stream = ReaderStream::new(reader);
+    let recorder = FileAccessRecorder::new(
+        state.db.clone(),
+        RecordResourceAccess {
+            user_id: session.user.id,
+            kind: ResourceKind::File,
+            path: relative_path.clone(),
+            route,
+            status: status.as_u16(),
+            bytes_served: 0,
+            file_size: Some(u64_to_i64(file_size)),
+            range_start: range.map(|value| u64_to_i64(value.start)),
+            range_end: range.map(|value| u64_to_i64(value.end)),
+        },
+    );
+    let stream = CountingFileStream::new(reader, recorder);
     let body = Body::from_stream(stream);
 
     let mut builder = Response::builder()
@@ -507,21 +528,88 @@ async fn serve_file_response(
         builder = builder.header(header::LAST_MODIFIED, lm);
     }
 
-    record_file_access(
-        state,
-        &session,
-        &relative_path,
-        route,
-        status,
-        content_length,
-        file_size,
-        range,
-    )
-    .await?;
-
     builder
         .body(body)
         .map_err(|_| ApiError::internal("Failed to build file response."))
+}
+
+struct FileAccessRecorder {
+    db: AuthDb,
+    access: RecordResourceAccess,
+    bytes_served: AtomicU64,
+    recorded: AtomicBool,
+}
+
+impl FileAccessRecorder {
+    fn new(db: AuthDb, access: RecordResourceAccess) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            access,
+            bytes_served: AtomicU64::new(0),
+            recorded: AtomicBool::new(false),
+        })
+    }
+
+    fn add_bytes(&self, len: usize) {
+        self.bytes_served
+            .fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn finalize_in_background(self: Arc<Self>) {
+        if self.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut access = self.access.clone();
+            access.bytes_served = u64_to_i64(self.bytes_served.load(Ordering::Acquire));
+            if let Err(err) = self.db.record_resource_access(access).await {
+                error!("failed to record file access: {err:?}");
+            }
+        });
+    }
+}
+
+struct CountingFileStream {
+    inner: Pin<Box<ReaderStream<tokio::io::Take<fs::File>>>>,
+    recorder: Arc<FileAccessRecorder>,
+}
+
+impl CountingFileStream {
+    fn new(reader: tokio::io::Take<fs::File>, recorder: Arc<FileAccessRecorder>) -> Self {
+        Self {
+            inner: Box::pin(ReaderStream::new(reader)),
+            recorder,
+        }
+    }
+}
+
+impl Stream for CountingFileStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.recorder.add_bytes(bytes.len());
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.recorder.clone().finalize_in_background();
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                self.recorder.clone().finalize_in_background();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CountingFileStream {
+    fn drop(&mut self) {
+        self.recorder.clone().finalize_in_background();
+    }
 }
 
 struct AccessibleFile {
@@ -808,12 +896,17 @@ pub async fn admin_audit_events_handler(
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditEventsResponse>> {
     require_admin(&state, &jar).await?;
-    Ok(Json(AuditEventsResponse {
-        events: state
-            .db
-            .list_access_events(query.user_id, query.limit.unwrap_or(100))
-            .await?,
-    }))
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let mut events = state
+        .db
+        .list_access_events_page(query.user_id, limit + 1, offset)
+        .await?;
+    let has_more = events.len() > limit as usize;
+    if has_more {
+        events.truncate(limit as usize);
+    }
+    Ok(Json(AuditEventsResponse { events, has_more }))
 }
 
 pub async fn admin_audit_resources_handler(
@@ -822,11 +915,19 @@ pub async fn admin_audit_resources_handler(
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditResourcesResponse>> {
     require_admin(&state, &jar).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let mut resources = state
+        .db
+        .list_resource_usage_page(query.user_id, limit + 1, offset)
+        .await?;
+    let has_more = resources.len() > limit as usize;
+    if has_more {
+        resources.truncate(limit as usize);
+    }
     Ok(Json(AuditResourcesResponse {
-        resources: state
-            .db
-            .list_resource_usage(query.user_id, query.limit.unwrap_or(100))
-            .await?,
+        resources,
+        has_more,
     }))
 }
 
@@ -1323,15 +1424,28 @@ fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> 
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
     use axum::http::HeaderMap;
+    use futures_util::StreamExt;
+    use tokio::io::AsyncReadExt;
+
+    use crate::db::{AuthDb, RecordResourceAccess, ResourceKind, UserRole};
 
     use super::{
-        content_disposition_inline, format_http_date, if_none_match_matches, if_range_matches,
-        make_etag, parse_range_header, parse_x_forwarded_for, signed_direct_file_url,
+        CountingFileStream, FileAccessRecorder, content_disposition_inline, format_http_date,
+        if_none_match_matches, if_range_matches, make_etag, parse_range_header,
+        parse_x_forwarded_for, signed_direct_file_url,
     };
+
+    fn test_path(name: &str, extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mlist-{name}-{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            extension
+        ))
+    }
 
     #[test]
     fn range_parses_open_ended() {
@@ -1380,6 +1494,57 @@ mod tests {
             signed_direct_file_url("电影/clip one.mp4", "abc123"),
             "/d/%E7%94%B5%E5%BD%B1/clip%20one.mp4?token=abc123"
         );
+    }
+
+    #[tokio::test]
+    async fn counting_stream_records_only_consumed_bytes_on_drop() {
+        let db_path = test_path("counting-stream", "sqlite3");
+        let file_path = test_path("counting-stream-file", "bin");
+        let db = AuthDb::connect(&db_path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+        let data = vec![7_u8; 128 * 1024];
+        tokio::fs::write(&file_path, &data).await.unwrap();
+
+        let file = tokio::fs::File::open(&file_path).await.unwrap();
+        let recorder = FileAccessRecorder::new(
+            db.clone(),
+            RecordResourceAccess {
+                user_id: user.id,
+                kind: ResourceKind::File,
+                path: "movie.bin".to_string(),
+                route: "/d",
+                status: 206,
+                bytes_served: 0,
+                file_size: Some(data.len() as i64),
+                range_start: Some(0),
+                range_end: Some(data.len() as i64 - 1),
+            },
+        );
+        let mut stream = CountingFileStream::new(file.take(data.len() as u64), recorder);
+        let first_chunk_len = stream.next().await.unwrap().unwrap().len();
+        assert!(first_chunk_len < data.len());
+        drop(stream);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let usage = db
+            .list_resource_usage_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].total_bytes_served, first_chunk_len as i64);
+
+        let events = db
+            .list_access_events_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bytes_served, first_chunk_len as i64);
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(file_path);
     }
 
     #[test]

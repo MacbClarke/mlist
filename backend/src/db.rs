@@ -160,10 +160,6 @@ pub struct ResourceUsageView {
     pub access_count: i64,
     pub total_bytes_served: i64,
     pub last_access_at: i64,
-    pub last_range_start: Option<i64>,
-    pub last_range_end: Option<i64>,
-    pub max_byte_end: Option<i64>,
-    pub progress: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,9 +297,6 @@ impl AuthDb {
                 access_count INTEGER NOT NULL DEFAULT 0,
                 total_bytes_served INTEGER NOT NULL DEFAULT 0,
                 last_access_at INTEGER NOT NULL,
-                last_range_start INTEGER,
-                last_range_end INTEGER,
-                max_byte_end INTEGER,
                 PRIMARY KEY (user_id, path)
             )
             "#,
@@ -697,33 +690,18 @@ impl AuthDb {
             .map_err(db_error)?;
 
         if matches!(access.kind, ResourceKind::File) {
-            let max_byte_end = if access.status == 304 {
-                None
-            } else {
-                access
-                    .range_end
-                    .or_else(|| access.file_size.and_then(|size| size.checked_sub(1)))
-            };
             sqlx::query(
                 r#"
                 INSERT INTO user_resource_usage (
                     user_id, path, file_size, access_count, total_bytes_served,
-                    last_access_at, last_range_start, last_range_end, max_byte_end
+                    last_access_at
                 )
-                VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, 1, ?4, ?5)
                 ON CONFLICT(user_id, path) DO UPDATE SET
                     file_size = excluded.file_size,
                     access_count = user_resource_usage.access_count + 1,
                     total_bytes_served = user_resource_usage.total_bytes_served + excluded.total_bytes_served,
-                    last_access_at = excluded.last_access_at,
-                    last_range_start = excluded.last_range_start,
-                    last_range_end = excluded.last_range_end,
-                    max_byte_end = CASE
-                        WHEN user_resource_usage.max_byte_end IS NULL THEN excluded.max_byte_end
-                        WHEN excluded.max_byte_end IS NULL THEN user_resource_usage.max_byte_end
-                        WHEN excluded.max_byte_end > user_resource_usage.max_byte_end THEN excluded.max_byte_end
-                        ELSE user_resource_usage.max_byte_end
-                    END
+                    last_access_at = excluded.last_access_at
                 "#,
             )
             .bind(access.user_id)
@@ -731,9 +709,6 @@ impl AuthDb {
             .bind(access.file_size)
             .bind(access.bytes_served)
             .bind(now)
-            .bind(access.range_start)
-            .bind(access.range_end)
-            .bind(max_byte_end)
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
@@ -749,12 +724,14 @@ impl AuthDb {
         Ok(())
     }
 
-    pub async fn list_access_events(
+    pub async fn list_access_events_page(
         &self,
         user_id: Option<i64>,
         limit: i64,
+        offset: i64,
     ) -> ApiResult<Vec<ResourceAccessEventView>> {
-        let limit = limit.clamp(1, 500);
+        let limit = limit.clamp(1, 501);
+        let offset = offset.max(0);
         let rows = if let Some(user_id) = user_id {
             sqlx::query(
                 r#"
@@ -766,10 +743,12 @@ impl AuthDb {
                 WHERE e.user_id = ?1
                 ORDER BY e.created_at DESC, e.id DESC
                 LIMIT ?2
+                OFFSET ?3
                 "#,
             )
             .bind(user_id)
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await
             .map_err(db_error)?
@@ -783,9 +762,11 @@ impl AuthDb {
                 JOIN users u ON u.id = e.user_id
                 ORDER BY e.created_at DESC, e.id DESC
                 LIMIT ?1
+                OFFSET ?2
                 "#,
             )
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await
             .map_err(db_error)?
@@ -794,28 +775,31 @@ impl AuthDb {
         Ok(rows.into_iter().map(event_from_row).collect())
     }
 
-    pub async fn list_resource_usage(
+    pub async fn list_resource_usage_page(
         &self,
         user_id: Option<i64>,
         limit: i64,
+        offset: i64,
     ) -> ApiResult<Vec<ResourceUsageView>> {
-        let limit = limit.clamp(1, 500);
+        let limit = limit.clamp(1, 501);
+        let offset = offset.max(0);
         let rows = if let Some(user_id) = user_id {
             sqlx::query(
                 r#"
                 SELECT
                     uru.user_id, u.username, uru.path, uru.file_size, uru.access_count,
-                    uru.total_bytes_served, uru.last_access_at, uru.last_range_start,
-                    uru.last_range_end, uru.max_byte_end
+                    uru.total_bytes_served, uru.last_access_at
                 FROM user_resource_usage uru
                 JOIN users u ON u.id = uru.user_id
                 WHERE uru.user_id = ?1
                 ORDER BY uru.last_access_at DESC
                 LIMIT ?2
+                OFFSET ?3
                 "#,
             )
             .bind(user_id)
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await
             .map_err(db_error)?
@@ -824,15 +808,16 @@ impl AuthDb {
                 r#"
                 SELECT
                     uru.user_id, u.username, uru.path, uru.file_size, uru.access_count,
-                    uru.total_bytes_served, uru.last_access_at, uru.last_range_start,
-                    uru.last_range_end, uru.max_byte_end
+                    uru.total_bytes_served, uru.last_access_at
                 FROM user_resource_usage uru
                 JOIN users u ON u.id = uru.user_id
                 ORDER BY uru.last_access_at DESC
                 LIMIT ?1
+                OFFSET ?2
                 "#,
             )
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await
             .map_err(db_error)?
@@ -1094,27 +1079,14 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> ResourceAccessEventView {
 }
 
 fn usage_from_row(row: sqlx::sqlite::SqliteRow) -> ResourceUsageView {
-    let file_size = row.get::<Option<i64>, _>("file_size");
-    let max_byte_end = row.get::<Option<i64>, _>("max_byte_end");
-    let progress = match (file_size, max_byte_end) {
-        (Some(size), Some(end)) if size > 0 && end >= 0 => {
-            Some(((end + 1) as f64 / size as f64).clamp(0.0, 1.0))
-        }
-        _ => None,
-    };
-
     ResourceUsageView {
         user_id: row.get("user_id"),
         username: row.get("username"),
         path: row.get("path"),
-        file_size,
+        file_size: row.get("file_size"),
         access_count: row.get("access_count"),
         total_bytes_served: row.get("total_bytes_served"),
         last_access_at: row.get("last_access_at"),
-        last_range_start: row.get("last_range_start"),
-        last_range_end: row.get("last_range_end"),
-        max_byte_end,
-        progress,
     }
 }
 
@@ -1171,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_access_updates_seen_totals_and_progress() {
+    async fn resource_access_updates_seen_and_totals() {
         let path = test_db_path("audit");
         let db = AuthDb::connect(&path).await.unwrap();
         let user = db
@@ -1243,16 +1215,17 @@ mod tests {
         assert!(users[0].last_seen_at.is_some());
         assert_eq!(users[0].total_bytes_served, 200);
 
-        let events = db.list_access_events(None, 10).await.unwrap();
+        let events = db.list_access_events_page(None, 10, 0).await.unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].path, "movies/demo.mp4");
 
-        let usage = db.list_resource_usage(Some(user.id), 10).await.unwrap();
+        let usage = db
+            .list_resource_usage_page(Some(user.id), 10, 0)
+            .await
+            .unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].access_count, 3);
         assert_eq!(usage[0].total_bytes_served, 200);
-        assert_eq!(usage[0].max_byte_end, Some(299));
-        assert_eq!(usage[0].progress, Some(0.3));
 
         let _ = std::fs::remove_file(path);
     }

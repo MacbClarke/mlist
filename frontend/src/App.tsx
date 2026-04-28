@@ -19,7 +19,6 @@ import {
   KeyRoundIcon,
   LockIcon,
   LogOutIcon,
-  ListChecksIcon,
   RefreshCwIcon,
   SettingsIcon,
   ShieldIcon,
@@ -163,18 +162,16 @@ type ResourceUsage = {
   accessCount: number
   totalBytesServed: number
   lastAccessAt: number
-  lastRangeStart?: number | null
-  lastRangeEnd?: number | null
-  maxByteEnd?: number | null
-  progress?: number | null
 }
 
 type AuditEventsResponse = {
   events: ResourceAccessEvent[]
+  hasMore: boolean
 }
 
 type AuditResourcesResponse = {
   resources: ResourceUsage[]
+  hasMore: boolean
 }
 
 type FileState = {
@@ -203,6 +200,8 @@ type LoadPathOptions = {
   previewPath?: string | null
   allowPathAsFile?: boolean
 }
+
+const AUDIT_PAGE_SIZE = 50
 
 function App() {
   const [authLoading, setAuthLoading] = useState(true)
@@ -990,7 +989,7 @@ function AdminView({
       <div className="flex items-center gap-2">
         <div className="min-w-0 flex-1">
           <h1 className="text-lg font-semibold">管理</h1>
-          <p className="text-muted-foreground text-sm">用户、资源访问审计和文件进度。</p>
+          <p className="text-muted-foreground text-sm">用户、资源访问审计和文件流量。</p>
         </div>
       </div>
       {error ? <FormError title="请求失败" message={error} /> : null}
@@ -1136,25 +1135,43 @@ function AuditView({
 }) {
   const [events, setEvents] = useState<ResourceAccessEvent[]>([])
   const [resources, setResources] = useState<ResourceUsage[]>([])
+  const [eventsPage, setEventsPage] = useState(0)
+  const [resourcesPage, setResourcesPage] = useState(0)
+  const [eventsHasMore, setEventsHasMore] = useState(false)
+  const [resourcesHasMore, setResourcesHasMore] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
 
   useEffect(() => {
+    setEventsPage(0)
+    setResourcesPage(0)
+  }, [selectedUserId])
+
+  useEffect(() => {
     void loadAudit()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedUserId])
+  }, [selectedUserId, eventsPage, resourcesPage])
 
   async function loadAudit() {
     setLoading(true)
     setError("")
     try {
-      const query = selectedUserId === "all" ? "limit=100" : `userId=${selectedUserId}&limit=100`
+      const baseQuery = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE) })
+      if (selectedUserId !== "all") {
+        baseQuery.set("userId", selectedUserId)
+      }
+      const eventsQuery = new URLSearchParams(baseQuery)
+      eventsQuery.set("offset", String(eventsPage * AUDIT_PAGE_SIZE))
+      const resourcesQuery = new URLSearchParams(baseQuery)
+      resourcesQuery.set("offset", String(resourcesPage * AUDIT_PAGE_SIZE))
       const [eventsPayload, resourcesPayload] = await Promise.all([
-        apiJson<AuditEventsResponse>(`/api/admin/audit/events?${query}`),
-        apiJson<AuditResourcesResponse>(`/api/admin/audit/resources?${query}`),
+        apiJson<AuditEventsResponse>(`/api/admin/audit/events?${eventsQuery}`),
+        apiJson<AuditResourcesResponse>(`/api/admin/audit/resources?${resourcesQuery}`),
       ])
       setEvents(eventsPayload.events)
       setResources(resourcesPayload.resources)
+      setEventsHasMore(eventsPayload.hasMore)
+      setResourcesHasMore(resourcesPayload.hasMore)
     } catch (err) {
       setError(err instanceof Error ? err.message : "审计数据加载失败")
     } finally {
@@ -1185,16 +1202,24 @@ function AuditView({
       </div>
       {error ? <FormError title="审计加载失败" message={error} /> : null}
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <ListChecksIcon className="size-4" />
-            文件进度
-          </CardTitle>
-          <CardDescription>淡绿色背景表示该用户对文件的最高请求位置估算。</CardDescription>
+        <CardHeader className="gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <CardTitle className="flex flex-1 items-center gap-2 text-base">
+              <DownloadIcon className="size-4" />
+              文件流量
+            </CardTitle>
+            <AuditPager
+              page={resourcesPage}
+              hasMore={resourcesHasMore}
+              disabled={loading}
+              onPageChange={setResourcesPage}
+            />
+          </div>
+          <CardDescription>按服务端实际流式发送的字节数累计。</CardDescription>
         </CardHeader>
         <CardContent>
           {loading && resources.length === 0 ? (
-            <p className="text-muted-foreground py-6 text-center text-sm">正在加载文件进度...</p>
+            <p className="text-muted-foreground py-6 text-center text-sm">正在加载文件流量...</p>
           ) : resources.length === 0 ? (
             <p className="text-muted-foreground rounded-md border border-dashed px-3 py-4 text-center text-sm">
               暂无文件访问记录
@@ -1202,7 +1227,7 @@ function AuditView({
           ) : (
             <ul className="space-y-2">
               {resources.map((resource) => (
-                <ResourceProgressRow
+                <ResourceUsageRow
                   key={`${resource.userId}:${resource.path}`}
                   resource={resource}
                   showUser={selectedUserId === "all"}
@@ -1213,8 +1238,16 @@ function AuditView({
         </CardContent>
       </Card>
       <Card className="py-1">
-        <CardHeader className="px-4 py-3">
-          <CardTitle className="text-base">最近访问</CardTitle>
+        <CardHeader className="gap-3 px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <CardTitle className="flex-1 text-base">最近访问</CardTitle>
+            <AuditPager
+              page={eventsPage}
+              hasMore={eventsHasMore}
+              disabled={loading}
+              onPageChange={setEventsPage}
+            />
+          </div>
           <CardDescription>最近 90 天内成功访问的目录和文件。</CardDescription>
         </CardHeader>
         <CardContent className="p-0">
@@ -1274,35 +1307,62 @@ function AuditView({
   )
 }
 
-function ResourceProgressRow({
+function ResourceUsageRow({
   resource,
   showUser,
 }: {
   resource: ResourceUsage
   showUser: boolean
 }) {
-  const progress = Math.round((resource.progress ?? 0) * 1000) / 10
-  const progressWidth = Math.min(100, Math.max(0, progress))
-  const background = `linear-gradient(90deg, rgba(187, 247, 208, 0.65) 0%, rgba(187, 247, 208, 0.65) ${progressWidth}%, transparent ${progressWidth}%, transparent 100%)`
-
   return (
     <li
       className="overflow-hidden rounded-md border px-3 py-2"
-      style={{ background }}
-      title={`${resource.path} · ${formatPercent(resource.progress)}`}
+      title={`${resource.path} · ${formatBytes(resource.totalBytesServed)}`}
     >
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
         <span className="min-w-0 flex-1 truncate font-mono text-xs">{resource.path}</span>
-        <span className="text-sm font-medium">{formatPercent(resource.progress)}</span>
+        <span className="text-sm font-medium">{formatBytes(resource.totalBytesServed)}</span>
       </div>
       <div className="text-muted-foreground mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs">
         {showUser ? <span>{resource.username}</span> : null}
-        <span>{formatBytes(resource.totalBytesServed)}</span>
         <span>{resource.accessCount} 次访问</span>
         <span>{formatDate(resource.lastAccessAt)}</span>
-        <span>{formatRange(resource.lastRangeStart, resource.lastRangeEnd)}</span>
       </div>
     </li>
+  )
+}
+
+function AuditPager({
+  page,
+  hasMore,
+  disabled,
+  onPageChange,
+}: {
+  page: number
+  hasMore: boolean
+  disabled: boolean
+  onPageChange: (page: number) => void
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={() => onPageChange(Math.max(0, page - 1))}
+        disabled={disabled || page === 0}
+      >
+        上一页
+      </Button>
+      <span className="text-muted-foreground min-w-12 text-center text-xs">第 {page + 1} 页</span>
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={() => onPageChange(page + 1)}
+        disabled={disabled || !hasMore}
+      >
+        下一页
+      </Button>
+    </div>
   )
 }
 
@@ -1655,11 +1715,6 @@ function formatBytes(bytes: number, fractionDigits?: number): string {
     unit += 1
   }
   return `${size.toFixed(fractionDigits ?? 1)} ${units[unit]}`
-}
-
-function formatPercent(value: number | null | undefined): string {
-  if (typeof value !== "number" || Number.isNaN(value)) return "--"
-  return `${(Math.min(1, Math.max(0, value)) * 100).toFixed(1)}%`
 }
 
 function formatRange(start: number | null | undefined, end: number | null | undefined): string {

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8.1", features = ["macros"] }
 axum-extra = { version = "0.10.0", features = ["cookie"] }
+futures-core = "0.3.32"
 http = "1.2.0"
 mime_guess = "2.0.5"
 serde = { version = "1.0.218", features = ["derive"] }
@@ -20,3 +21,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { version = "1.15.1", features = ["v4"] }
 time = { version = "0.3.37", features = ["formatting"] }
+
+[dev-dependencies]
+futures-util = "0.3.32"

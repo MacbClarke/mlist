@@ -2,10 +2,9 @@ use crate::errors::{ApiError, ApiResult};
 use std::path::{Component, Path, PathBuf};
 
 pub const PRIVATE_MARKER_FILE: &str = ".private";
-pub const PASSWORD_MARKER_FILE: &str = ".password";
 
 pub fn is_private_marker_name(name: &str) -> bool {
-    matches!(name, PRIVATE_MARKER_FILE | PASSWORD_MARKER_FILE)
+    name == PRIVATE_MARKER_FILE
 }
 
 pub fn normalize_relative_path(raw: Option<&str>) -> ApiResult<String> {

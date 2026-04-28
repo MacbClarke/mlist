@@ -3,12 +3,11 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::errors::{ApiError, ApiResult};
-use crate::path_guard::{PASSWORD_MARKER_FILE, PRIVATE_MARKER_FILE, relative_string_from_root};
+use crate::path_guard::{PRIVATE_MARKER_FILE, relative_string_from_root};
 
 #[derive(Debug, Clone)]
 pub struct PrivateAnchor {
     pub scope_rel: String,
-    pub password: String,
     pub marker_file: &'static str,
 }
 
@@ -30,11 +29,10 @@ pub async fn find_private_anchor(
     };
 
     loop {
-        if let Some(password) = read_marker_password(&current, PASSWORD_MARKER_FILE).await? {
+        if marker_exists(&current, PRIVATE_MARKER_FILE).await? {
             return Ok(Some(PrivateAnchor {
                 scope_rel: relative_string_from_root(root, &current)?,
-                password,
-                marker_file: PASSWORD_MARKER_FILE,
+                marker_file: PRIVATE_MARKER_FILE,
             }));
         }
 
@@ -64,18 +62,6 @@ fn parent_within_root(current: &Path, root: &Path) -> ApiResult<PathBuf> {
     }
 
     Ok(parent.to_path_buf())
-}
-
-async fn read_marker_password(dir: &Path, marker_name: &'static str) -> ApiResult<Option<String>> {
-    if !marker_exists(dir, marker_name).await? {
-        return Ok(None);
-    }
-
-    let marker_path = dir.join(marker_name);
-    let raw = fs::read_to_string(&marker_path)
-        .await
-        .map_err(|err| ApiError::from_io(err, "marker file"))?;
-    Ok(Some(raw.trim().to_string()))
 }
 
 async fn marker_exists(dir: &Path, marker_name: &'static str) -> ApiResult<bool> {

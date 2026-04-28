@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,29 +15,45 @@ use time::{Month, OffsetDateTime, UtcOffset, Weekday};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
+use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::info;
 
 use crate::auth::{find_private_anchor, has_private_hide_marker};
 use crate::config::AppConfig;
+use crate::db::{
+    AuthDb, AuthSession, RecordResourceAccess, ResourceAccessEventView, ResourceKind,
+    ResourceUsageView, UserFileStateView, UserRole, UserRoleInput, UserView,
+};
 use crate::errors::{ApiError, ApiResult};
 use crate::path_guard::{
     ensure_not_marker_path, is_private_marker_name, normalize_relative_path, resolve_existing_path,
 };
-use crate::session::{
-    LoginRateLimiter, SESSION_COOKIE_NAME, SessionData, SessionStore, SessionView, now_unix,
-    unix_to_rfc3339,
-};
+use crate::session::{LoginRateLimiter, SESSION_COOKIE_NAME, now_unix, unix_to_rfc3339};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub sessions: SessionStore,
+    pub db: AuthDb,
     pub login_limiter: LoginRateLimiter,
 }
+
+const SIGNED_FILE_LINK_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
     pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DirectFileQuery {
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditQuery {
+    pub user_id: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,24 +87,103 @@ pub enum EntryKind {
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    pub path: String,
-    pub password: String,
+    pub username: String,
+    pub code: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginResponse {
     pub ok: bool,
-    pub scope: String,
     pub expires_at: String,
+    pub user: UserView,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     pub authenticated: bool,
-    pub scopes: Vec<String>,
+    pub user: Option<UserView>,
     pub expires_at: Option<String>,
+    pub needs_bootstrap: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapStartRequest {
+    pub username: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapFinishRequest {
+    pub username: String,
+    pub secret: String,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub role: UserRoleInput,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileStateRequest {
+    pub path: String,
+    pub highlighted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignedFileLinkRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedFileLinkResponse {
+    pub url: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpBindingResponse {
+    pub user: UserView,
+    pub secret: String,
+    pub otpauth_url: String,
+    pub qr_data_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapStartResponse {
+    pub username: String,
+    pub secret: String,
+    pub otpauth_url: String,
+    pub qr_data_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsersResponse {
+    pub users: Vec<UserView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventsResponse {
+    pub events: Vec<ResourceAccessEventView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditResourcesResponse {
+    pub resources: Vec<ResourceUsageView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStatesResponse {
+    pub files: Vec<UserFileStateView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +208,7 @@ pub async fn list_handler(
     jar: CookieJar,
     Query(query): Query<PathQuery>,
 ) -> ApiResult<Json<ListResponse>> {
+    let session = require_session(&state, &jar).await?;
     let relative_path = normalize_relative_path(query.path.as_deref())?;
     ensure_not_marker_path(&relative_path)?;
 
@@ -126,11 +222,16 @@ pub async fn list_handler(
         return Err(ApiError::bad_request("Path is not a directory."));
     }
 
-    let session = current_session(&state, &jar).await;
     let anchor = find_private_anchor(root, &resolved, true).await?;
     if let Some(private_anchor) = &anchor {
-        if !is_scope_authorized(session.as_ref(), &private_anchor.scope_rel) {
-            return Err(ApiError::auth_required());
+        if !session.user.role.is_admin() {
+            info!(
+                user = session.user.username,
+                scope = private_anchor.scope_rel,
+                marker = private_anchor.marker_file,
+                "non-admin private directory access denied"
+            );
+            return Err(ApiError::not_found("Path not found."));
         }
     }
 
@@ -173,7 +274,10 @@ pub async fn list_handler(
             .await
             .map_err(|err| ApiError::from_io(err, "directory entry"))?;
 
-        if file_type.is_dir() && has_private_hide_marker(&resolved_entry).await? {
+        if file_type.is_dir()
+            && has_private_hide_marker(&resolved_entry).await?
+            && !session.user.role.is_admin()
+        {
             continue;
         }
 
@@ -181,8 +285,11 @@ pub async fn list_handler(
         let requires_auth = entry_anchor.is_some();
         let authorized = entry_anchor
             .as_ref()
-            .map(|value| is_scope_authorized(session.as_ref(), &value.scope_rel))
+            .map(|_| session.user.role.is_admin())
             .unwrap_or(true);
+        if requires_auth && !authorized {
+            continue;
+        }
 
         let mime = if file_type.is_file() {
             Some(
@@ -228,6 +335,21 @@ pub async fn list_handler(
         a.name.to_lowercase().cmp(&b.name.to_lowercase())
     });
 
+    state
+        .db
+        .record_resource_access(RecordResourceAccess {
+            user_id: session.user.id,
+            kind: ResourceKind::Directory,
+            path: relative_path.clone(),
+            route: "/api/list",
+            status: StatusCode::OK.as_u16(),
+            bytes_served: 0,
+            file_size: None,
+            range_start: None,
+            range_end: None,
+        })
+        .await?;
+
     Ok(Json(ListResponse {
         path: relative_path,
         entries,
@@ -236,24 +358,23 @@ pub async fn list_handler(
     }))
 }
 
-pub async fn file_handler(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<PathQuery>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
-    let relative_path = normalize_relative_path(query.path.as_deref())?;
-    serve_file_response(&state, &jar, &headers, relative_path).await
-}
-
 pub async fn direct_file_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     AxumPath(raw_path): AxumPath<String>,
+    Query(query): Query<DirectFileQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let relative_path = normalize_relative_path(Some(&raw_path))?;
-    serve_file_response(&state, &jar, &headers, relative_path).await
+    serve_file_response(
+        &state,
+        &jar,
+        &headers,
+        relative_path,
+        "/d",
+        query.token.as_deref(),
+    )
+    .await
 }
 
 async fn serve_file_response(
@@ -261,31 +382,13 @@ async fn serve_file_response(
     jar: &CookieJar,
     headers: &HeaderMap,
     relative_path: String,
+    route: &'static str,
+    signed_token: Option<&str>,
 ) -> ApiResult<Response> {
-    ensure_not_marker_path(&relative_path)?;
-    if relative_path.is_empty() {
-        return Err(ApiError::bad_request("Path must reference a file."));
-    }
-
-    let root = &state.config.root_dir;
-    let resolved = resolve_existing_path(root, &relative_path).await?;
-    let metadata = fs::metadata(&resolved)
-        .await
-        .map_err(|err| ApiError::from_io(err, "file"))?;
-    if !metadata.is_file() {
-        return Err(ApiError::bad_request("Path is not a file."));
-    }
-
-    if file_name_is_marker(&resolved) {
-        return Err(ApiError::not_found("File not found."));
-    }
-
-    let session = current_session(&state, &jar).await;
-    if let Some(anchor) = find_private_anchor(root, &resolved, false).await? {
-        if !is_scope_authorized(session.as_ref(), &anchor.scope_rel) {
-            return Err(ApiError::auth_required());
-        }
-    }
+    let session = file_session_for_request(state, jar, &relative_path, signed_token).await?;
+    let accessible = ensure_file_accessible(state, &session, &relative_path).await?;
+    let resolved = accessible.resolved;
+    let metadata = accessible.metadata;
 
     let file_size = metadata.len();
     let mime = mime_guess::from_path(&resolved)
@@ -304,6 +407,17 @@ async fn serve_file_response(
         .and_then(|v| v.to_str().ok());
     if let (Some(raw), Some(tag)) = (inm_header, etag.as_deref()) {
         if if_none_match_matches(raw, tag) {
+            record_file_access(
+                state,
+                &session,
+                &relative_path,
+                route,
+                StatusCode::NOT_MODIFIED,
+                0,
+                file_size,
+                None,
+            )
+            .await?;
             return build_not_modified(etag.as_deref(), last_modified.as_deref());
         }
     } else if inm_header.is_none() {
@@ -312,6 +426,17 @@ async fn serve_file_response(
             .and_then(|v| v.to_str().ok());
         if let (Some(raw), Some(lm)) = (ims_header, last_modified.as_deref()) {
             if raw.trim() == lm {
+                record_file_access(
+                    state,
+                    &session,
+                    &relative_path,
+                    route,
+                    StatusCode::NOT_MODIFIED,
+                    0,
+                    file_size,
+                    None,
+                )
+                .await?;
                 return build_not_modified(etag.as_deref(), last_modified.as_deref());
             }
         }
@@ -384,9 +509,94 @@ async fn serve_file_response(
         builder = builder.header(header::LAST_MODIFIED, lm);
     }
 
+    record_file_access(
+        state,
+        &session,
+        &relative_path,
+        route,
+        status,
+        content_length,
+        file_size,
+        range,
+    )
+    .await?;
+
     builder
         .body(body)
         .map_err(|_| ApiError::internal("Failed to build file response."))
+}
+
+struct AccessibleFile {
+    resolved: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+async fn ensure_file_accessible(
+    state: &AppState,
+    session: &AuthSession,
+    relative_path: &str,
+) -> ApiResult<AccessibleFile> {
+    ensure_not_marker_path(relative_path)?;
+    if relative_path.is_empty() {
+        return Err(ApiError::bad_request("Path must reference a file."));
+    }
+
+    let root = &state.config.root_dir;
+    let resolved = resolve_existing_path(root, relative_path).await?;
+    let metadata = fs::metadata(&resolved)
+        .await
+        .map_err(|err| ApiError::from_io(err, "file"))?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request("Path is not a file."));
+    }
+
+    if file_name_is_marker(&resolved) {
+        return Err(ApiError::not_found("File not found."));
+    }
+
+    if let Some(anchor) = find_private_anchor(root, &resolved, false).await? {
+        if !session.user.role.is_admin() {
+            info!(
+                user = session.user.username,
+                scope = anchor.scope_rel,
+                marker = anchor.marker_file,
+                "non-admin private file access denied"
+            );
+            return Err(ApiError::not_found("File not found."));
+        }
+    }
+
+    Ok(AccessibleFile { resolved, metadata })
+}
+
+async fn record_file_access(
+    state: &AppState,
+    session: &AuthSession,
+    path: &str,
+    route: &'static str,
+    status: StatusCode,
+    bytes_served: u64,
+    file_size: u64,
+    range: Option<ByteRange>,
+) -> ApiResult<()> {
+    state
+        .db
+        .record_resource_access(RecordResourceAccess {
+            user_id: session.user.id,
+            kind: ResourceKind::File,
+            path: path.to_string(),
+            route,
+            status: status.as_u16(),
+            bytes_served: u64_to_i64(bytes_served),
+            file_size: Some(u64_to_i64(file_size)),
+            range_start: range.map(|value| u64_to_i64(value.start)),
+            range_end: range.map(|value| u64_to_i64(value.end)),
+        })
+        .await
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn build_not_modified(etag: Option<&str>, last_modified: Option<&str>) -> ApiResult<Response> {
@@ -429,22 +639,10 @@ pub async fn login_handler(
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
-    let relative_path = normalize_relative_path(Some(&payload.path))?;
-    ensure_not_marker_path(&relative_path)?;
-
-    let root = &state.config.root_dir;
-    let resolved = resolve_existing_path(root, &relative_path).await?;
-    let metadata = fs::metadata(&resolved)
-        .await
-        .map_err(|err| ApiError::from_io(err, "path"))?;
-
-    let Some(anchor) = find_private_anchor(root, &resolved, metadata.is_dir()).await? else {
-        return Err(ApiError::bad_request("The target path is public."));
-    };
-
     let now = now_unix();
     let client_ip = client_ip_for_request(&headers, connect_info.ip()).to_string();
-    let limiter_key = format!("{client_ip}:{}", anchor.scope_rel);
+    let username = payload.username.trim();
+    let limiter_key = format!("{client_ip}:{}", username.to_lowercase());
 
     if let Some(until) = state.login_limiter.blocked_until(&limiter_key, now).await {
         let remaining = until.saturating_sub(now);
@@ -453,38 +651,41 @@ pub async fn login_handler(
         )));
     }
 
-    if payload.password != anchor.password {
+    let user = state
+        .db
+        .user_by_username(username)
+        .await?
+        .filter(|value| value.enabled);
+
+    let valid = match user.as_ref() {
+        Some(user) => verify_totp(&user.username, &user.totp_secret, &payload.code)?,
+        None => false,
+    };
+
+    if !valid {
         if let Some(until) = state.login_limiter.record_failure(&limiter_key, now).await {
             let remaining = until.saturating_sub(now);
             return Err(ApiError::rate_limited(format!(
                 "Too many login failures. Retry in {remaining} seconds."
             )));
         }
-        return Err(ApiError::unauthorized("Invalid password."));
+        return Err(ApiError::unauthorized("Invalid username or code."));
     }
 
+    let user = user.ok_or_else(|| ApiError::unauthorized("Invalid username or code."))?;
     state.login_limiter.record_success(&limiter_key).await;
 
-    let current_sid = jar.get(SESSION_COOKIE_NAME).map(|value| value.value());
-    let (session_id, session_data) = state
-        .sessions
-        .create_or_update(
-            current_sid,
-            &anchor.scope_rel,
-            state.config.session_ttl_seconds,
-            now,
-        )
-        .await;
+    let session_token = uuid::Uuid::new_v4().simple().to_string();
+    let expires_at = state
+        .db
+        .create_session(user.id, &session_token, state.config.session_ttl_seconds)
+        .await?;
+    state.db.record_login(user.id).await?;
 
-    info!(
-        ip = client_ip,
-        scope = anchor.scope_rel,
-        marker = anchor.marker_file,
-        "login succeeded"
-    );
+    info!(ip = client_ip, user = user.username, "login succeeded");
 
     let cookie = build_session_cookie(
-        &session_id,
+        &session_token,
         state.config.session_ttl_seconds,
         state.config.secure_cookies,
     );
@@ -494,8 +695,69 @@ pub async fn login_handler(
         updated_jar,
         Json(LoginResponse {
             ok: true,
-            scope: anchor.scope_rel,
-            expires_at: unix_to_rfc3339(session_data.expires_at),
+            expires_at: unix_to_rfc3339(expires_at as u64),
+            user: user.view(),
+        }),
+    ))
+}
+
+pub async fn bootstrap_start_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<BootstrapStartRequest>,
+) -> ApiResult<Json<BootstrapStartResponse>> {
+    if !state.db.needs_bootstrap().await? {
+        return Err(ApiError::forbidden("Bootstrap has already been completed."));
+    }
+
+    let username = payload.username.trim();
+    validate_login_name(username)?;
+    let secret = generate_totp_secret();
+    let binding = build_totp_binding(username, &secret)?;
+    Ok(Json(BootstrapStartResponse {
+        username: username.to_string(),
+        secret,
+        otpauth_url: binding.otpauth_url,
+        qr_data_url: binding.qr_data_url,
+    }))
+}
+
+pub async fn bootstrap_finish_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<BootstrapFinishRequest>,
+) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
+    if !state.db.needs_bootstrap().await? {
+        return Err(ApiError::forbidden("Bootstrap has already been completed."));
+    }
+
+    let username = payload.username.trim();
+    validate_login_name(username)?;
+    if !verify_totp(username, &payload.secret, &payload.code)? {
+        return Err(ApiError::unauthorized("Invalid verification code."));
+    }
+
+    let user = state.db.bootstrap_admin(username, &payload.secret).await?;
+    let session_token = uuid::Uuid::new_v4().simple().to_string();
+    let expires_at = state
+        .db
+        .create_session(user.id, &session_token, state.config.session_ttl_seconds)
+        .await?;
+    state.db.record_login(user.id).await?;
+    info!(user = user.username, "bootstrap admin created");
+
+    let cookie = build_session_cookie(
+        &session_token,
+        state.config.session_ttl_seconds,
+        state.config.secure_cookies,
+    );
+    let updated_jar = jar.add(cookie);
+
+    Ok((
+        updated_jar,
+        Json(LoginResponse {
+            ok: true,
+            expires_at: unix_to_rfc3339(expires_at as u64),
+            user: user.view(),
         }),
     ))
 }
@@ -505,7 +767,7 @@ pub async fn logout_handler(
     jar: CookieJar,
 ) -> ApiResult<(CookieJar, Json<GenericOkResponse>)> {
     if let Some(cookie) = jar.get(SESSION_COOKIE_NAME) {
-        state.sessions.remove(cookie.value()).await;
+        state.db.remove_session(cookie.value()).await?;
     }
 
     let removal = Cookie::build((SESSION_COOKIE_NAME, ""))
@@ -522,20 +784,163 @@ pub async fn me_handler(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> ApiResult<Json<MeResponse>> {
-    let Some(session) = current_session(&state, &jar).await else {
+    let needs_bootstrap = state.db.needs_bootstrap().await?;
+    let Some(session) = current_session(&state, &jar).await? else {
         return Ok(Json(MeResponse {
             authenticated: false,
-            scopes: Vec::new(),
+            user: None,
             expires_at: None,
+            needs_bootstrap,
         }));
     };
 
-    let session_view: SessionView = session.into();
     Ok(Json(MeResponse {
         authenticated: true,
-        scopes: session_view.scopes,
-        expires_at: Some(session_view.expires_at),
+        user: Some(session.user.view()),
+        expires_at: Some(unix_to_rfc3339(session.expires_at as u64)),
+        needs_bootstrap,
     }))
+}
+
+pub async fn admin_users_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<UsersResponse>> {
+    require_admin(&state, &jar).await?;
+    Ok(Json(UsersResponse {
+        users: state.db.list_users().await?,
+    }))
+}
+
+pub async fn admin_audit_events_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<AuditEventsResponse>> {
+    require_admin(&state, &jar).await?;
+    Ok(Json(AuditEventsResponse {
+        events: state
+            .db
+            .list_access_events(query.user_id, query.limit.unwrap_or(100))
+            .await?,
+    }))
+}
+
+pub async fn admin_audit_resources_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<AuditResourcesResponse>> {
+    require_admin(&state, &jar).await?;
+    Ok(Json(AuditResourcesResponse {
+        resources: state
+            .db
+            .list_resource_usage(query.user_id, query.limit.unwrap_or(100))
+            .await?,
+    }))
+}
+
+pub async fn admin_create_user_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<CreateUserRequest>,
+) -> ApiResult<Json<TotpBindingResponse>> {
+    require_admin(&state, &jar).await?;
+    let username = payload.username.trim();
+    validate_login_name(username)?;
+    let secret = generate_totp_secret();
+    let user = state
+        .db
+        .create_user(username, UserRole::from(payload.role), &secret)
+        .await?;
+    Ok(Json(binding_response(user.view(), &secret)?))
+}
+
+pub async fn admin_disable_user_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(user_id): AxumPath<i64>,
+) -> ApiResult<Json<UserView>> {
+    require_admin(&state, &jar).await?;
+    Ok(Json(state.db.set_user_enabled(user_id, false).await?))
+}
+
+pub async fn admin_enable_user_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(user_id): AxumPath<i64>,
+) -> ApiResult<Json<UserView>> {
+    require_admin(&state, &jar).await?;
+    Ok(Json(state.db.set_user_enabled(user_id, true).await?))
+}
+
+pub async fn admin_delete_user_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(user_id): AxumPath<i64>,
+) -> ApiResult<Json<GenericOkResponse>> {
+    require_admin(&state, &jar).await?;
+    state.db.delete_user(user_id).await?;
+    Ok(Json(GenericOkResponse { ok: true }))
+}
+
+pub async fn admin_reset_totp_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(user_id): AxumPath<i64>,
+) -> ApiResult<Json<TotpBindingResponse>> {
+    require_admin(&state, &jar).await?;
+    let secret = generate_totp_secret();
+    let user = state.db.reset_totp(user_id, &secret).await?;
+    Ok(Json(binding_response(user.view(), &secret)?))
+}
+
+pub async fn create_file_link_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<SignedFileLinkRequest>,
+) -> ApiResult<Json<SignedFileLinkResponse>> {
+    let session = require_session(&state, &jar).await?;
+    let path = normalize_relative_path(Some(&payload.path))?;
+    ensure_file_accessible(&state, &session, &path).await?;
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let expires_at = state
+        .db
+        .create_signed_file_token(session.user.id, &path, &token, SIGNED_FILE_LINK_TTL_SECONDS)
+        .await?;
+
+    Ok(Json(SignedFileLinkResponse {
+        url: signed_direct_file_url(&path, &token),
+        expires_at: unix_to_rfc3339(expires_at as u64),
+    }))
+}
+
+pub async fn file_states_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<FileStatesResponse>> {
+    let session = require_session(&state, &jar).await?;
+    Ok(Json(FileStatesResponse {
+        files: state.db.list_highlighted_files(session.user.id).await?,
+    }))
+}
+
+pub async fn set_file_state_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<FileStateRequest>,
+) -> ApiResult<Json<UserFileStateView>> {
+    let session = require_session(&state, &jar).await?;
+    let path = normalize_relative_path(Some(&payload.path))?;
+    ensure_file_accessible(&state, &session, &path).await?;
+
+    Ok(Json(
+        state
+            .db
+            .set_file_highlighted(session.user.id, &path, payload.highlighted)
+            .await?,
+    ))
 }
 
 fn client_ip_for_request(headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
@@ -584,21 +989,156 @@ fn build_session_cookie(
     builder.build()
 }
 
-async fn current_session(state: &AppState, jar: &CookieJar) -> Option<SessionData> {
-    let sid = jar.get(SESSION_COOKIE_NAME)?.value().to_string();
-    state.sessions.get_valid(&sid, now_unix()).await
+async fn current_session(state: &AppState, jar: &CookieJar) -> ApiResult<Option<AuthSession>> {
+    let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
+        return Ok(None);
+    };
+    let sid = cookie.value().to_string();
+    state.db.session_by_token(&sid).await
 }
 
-fn is_scope_authorized(session: Option<&SessionData>, scope: &str) -> bool {
-    session
-        .map(|value| value.scopes.contains(scope))
-        .unwrap_or(false)
+async fn file_session_for_request(
+    state: &AppState,
+    jar: &CookieJar,
+    relative_path: &str,
+    signed_token: Option<&str>,
+) -> ApiResult<AuthSession> {
+    if let Some(session) = current_session(state, jar).await? {
+        return Ok(session);
+    }
+
+    let Some(token) = signed_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(ApiError::auth_required());
+    };
+
+    state
+        .db
+        .signed_file_session(token, relative_path)
+        .await?
+        .ok_or_else(ApiError::auth_required)
+}
+
+async fn require_session(state: &AppState, jar: &CookieJar) -> ApiResult<AuthSession> {
+    current_session(state, jar)
+        .await?
+        .ok_or_else(ApiError::auth_required)
+}
+
+async fn require_admin(state: &AppState, jar: &CookieJar) -> ApiResult<AuthSession> {
+    let session = require_session(state, jar).await?;
+    if !session.user.role.is_admin() {
+        return Err(ApiError::forbidden("Administrator privileges required."));
+    }
+    Ok(session)
+}
+
+fn validate_login_name(username: &str) -> ApiResult<()> {
+    if username.trim().len() < 2 || username.trim().len() > 64 {
+        return Err(ApiError::bad_request(
+            "Username must be between 2 and 64 characters.",
+        ));
+    }
+    if username.chars().any(|c| c.is_control()) {
+        return Err(ApiError::bad_request(
+            "Username contains disallowed control characters.",
+        ));
+    }
+    Ok(())
+}
+
+fn generate_totp_secret() -> String {
+    Secret::generate_secret().to_encoded().to_string()
+}
+
+struct TotpBinding {
+    otpauth_url: String,
+    qr_data_url: String,
+}
+
+fn build_totp(username: &str, secret: &str) -> ApiResult<TOTP> {
+    let secret_bytes = Secret::Encoded(secret.to_string())
+        .to_bytes()
+        .map_err(|_| ApiError::bad_request("Invalid TOTP secret."))?;
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("mlist".to_string()),
+        username.to_string(),
+    )
+    .map_err(|_| ApiError::bad_request("Invalid TOTP configuration."))
+}
+
+fn build_totp_binding(username: &str, secret: &str) -> ApiResult<TotpBinding> {
+    let totp = build_totp(username, secret)?;
+    let otpauth_url = totp.get_url();
+    let qr_data_url = format!(
+        "data:image/png;base64,{}",
+        totp.get_qr_base64()
+            .map_err(|_| ApiError::internal("Failed to generate QR code."))?
+    );
+    Ok(TotpBinding {
+        otpauth_url,
+        qr_data_url,
+    })
+}
+
+fn binding_response(user: UserView, secret: &str) -> ApiResult<TotpBindingResponse> {
+    let binding = build_totp_binding(&user.username, secret)?;
+    Ok(TotpBindingResponse {
+        user,
+        secret: secret.to_string(),
+        otpauth_url: binding.otpauth_url,
+        qr_data_url: binding.qr_data_url,
+    })
+}
+
+fn verify_totp(username: &str, secret: &str, code: &str) -> ApiResult<bool> {
+    let trimmed = code.trim();
+    if trimmed.len() != 6 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(false);
+    }
+    build_totp(username, secret)?
+        .check_current(trimmed)
+        .map_err(|_| ApiError::internal("Failed to verify TOTP code."))
 }
 
 fn file_name_is_marker(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
         .is_some_and(is_private_marker_name)
+}
+
+fn signed_direct_file_url(path: &str, token: &str) -> String {
+    let encoded_path = path
+        .split('/')
+        .map(url_path_segment_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/d/{encoded_path}?token={token}")
+}
+
+fn url_path_segment_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if is_url_unreserved(*byte) {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push('%');
+            encoded.push(to_hex_upper(byte >> 4));
+            encoded.push(to_hex_upper(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
+fn is_url_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn content_disposition_inline(path: &Path) -> String {
@@ -804,7 +1344,7 @@ mod tests {
 
     use super::{
         content_disposition_inline, format_http_date, if_none_match_matches, if_range_matches,
-        make_etag, parse_range_header, parse_x_forwarded_for,
+        make_etag, parse_range_header, parse_x_forwarded_for, signed_direct_file_url,
     };
 
     #[test]
@@ -845,6 +1385,14 @@ mod tests {
         assert!(disposition.contains("filename=\"__ __.ass\""));
         assert!(
             disposition.contains("filename*=UTF-8''%E4%BD%A0%E5%A5%BD%20%E5%AD%97%E5%B9%95.ass")
+        );
+    }
+
+    #[test]
+    fn signed_direct_file_url_encodes_path_segments() {
+        assert_eq!(
+            signed_direct_file_url("电影/clip one.mp4", "abc123"),
+            "/d/%E7%94%B5%E5%BD%B1/clip%20one.mp4?token=abc123"
         );
     }
 

@@ -5,6 +5,7 @@ use std::{env, fs, path::PathBuf};
 #[serde(default)]
 pub struct AppConfig {
     pub root_dir: PathBuf,
+    pub database_path: PathBuf,
     pub bind_addr: String,
     pub session_ttl_seconds: u64,
     pub secure_cookies: bool,
@@ -17,8 +18,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::from("/mlist-files"),
+            database_path: PathBuf::from("/mlist-data/mlist.sqlite3"),
             bind_addr: "0.0.0.0:3000".to_string(),
-            session_ttl_seconds: 1800,
+            session_ttl_seconds: 2_592_000,
             secure_cookies: false,
             login_max_failures: 5,
             login_block_seconds: 60,
@@ -39,6 +41,9 @@ impl AppConfig {
 
         if !cfg.root_dir.is_absolute() {
             return Err("root_dir must be an absolute path.".to_string());
+        }
+        if !cfg.database_path.is_absolute() {
+            return Err("database_path must be an absolute path.".to_string());
         }
 
         let canonical_root = fs::canonicalize(&cfg.root_dir).map_err(|err| {

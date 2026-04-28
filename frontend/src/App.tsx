@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from "react"
-import type { FormEvent } from "react"
+import type { FormEvent, ReactNode } from "react"
 import {
   AlertCircleIcon,
+  ActivityIcon,
   ArrowLeftIcon,
+  BanIcon,
+  CheckCircleIcon,
   CircleOffIcon,
   CopyIcon,
   DownloadIcon,
@@ -13,8 +16,15 @@ import {
   FileTextIcon,
   FolderIcon,
   ImageIcon,
+  KeyRoundIcon,
   LockIcon,
+  LogOutIcon,
+  ListChecksIcon,
   RefreshCwIcon,
+  SettingsIcon,
+  ShieldIcon,
+  Trash2Icon,
+  UserPlusIcon,
 } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -30,7 +40,8 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   ContextMenu,
   ContextMenuContent,
@@ -46,6 +57,23 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
 type EntryKind = "dir" | "file"
 
@@ -67,6 +95,103 @@ type ListResponse = {
   authorized: boolean
 }
 
+type UserRole = "admin" | "user"
+
+type UserView = {
+  id: number
+  username: string
+  role: UserRole
+  enabled: boolean
+  createdAt: number
+  updatedAt: number
+  lastLoginAt?: number | null
+  lastSeenAt?: number | null
+  totalBytesServed: number
+}
+
+type MeResponse = {
+  authenticated: boolean
+  user: UserView | null
+  expiresAt: string | null
+  needsBootstrap: boolean
+}
+
+type LoginResponse = {
+  ok: boolean
+  user: UserView
+  expiresAt: string
+}
+
+type TotpBinding = {
+  user: UserView
+  secret: string
+  otpauthUrl: string
+  qrDataUrl: string
+}
+
+type BootstrapStartResponse = {
+  username: string
+  secret: string
+  otpauthUrl: string
+  qrDataUrl: string
+}
+
+type UsersResponse = {
+  users: UserView[]
+}
+
+type ResourceAccessEvent = {
+  id: number
+  userId: number
+  username: string
+  resourceKind: "directory" | "file"
+  path: string
+  route: string
+  status: number
+  bytesServed: number
+  fileSize?: number | null
+  rangeStart?: number | null
+  rangeEnd?: number | null
+  createdAt: number
+}
+
+type ResourceUsage = {
+  userId: number
+  username: string
+  path: string
+  fileSize?: number | null
+  accessCount: number
+  totalBytesServed: number
+  lastAccessAt: number
+  lastRangeStart?: number | null
+  lastRangeEnd?: number | null
+  maxByteEnd?: number | null
+  progress?: number | null
+}
+
+type AuditEventsResponse = {
+  events: ResourceAccessEvent[]
+}
+
+type AuditResourcesResponse = {
+  resources: ResourceUsage[]
+}
+
+type FileState = {
+  path: string
+  highlighted: boolean
+  updatedAt: number
+}
+
+type FileStatesResponse = {
+  files: FileState[]
+}
+
+type SignedFileLinkResponse = {
+  url: string
+  expiresAt: string
+}
+
 type ApiError = {
   code?: string
   message?: string
@@ -79,22 +204,17 @@ type LoadPathOptions = {
   allowPathAsFile?: boolean
 }
 
-const HIGHLIGHTED_FILES_STORAGE_KEY = "mlist.highlighted-files.v1"
-
 function App() {
+  const [authLoading, setAuthLoading] = useState(true)
+  const [user, setUser] = useState<UserView | null>(null)
+  const [needsBootstrap, setNeedsBootstrap] = useState(false)
+  const [adminRoute, setAdminRoute] = useState(() => isAdminPath(window.location.pathname))
   const [currentPath, setCurrentPath] = useState("")
   const [entries, setEntries] = useState<ListEntry[]>([])
   const [previewEntry, setPreviewEntry] = useState<ListEntry | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
-  const [authPath, setAuthPath] = useState<string | null>(null)
-  const [authPassword, setAuthPassword] = useState("")
-  const [authError, setAuthError] = useState("")
-  const [authSubmitting, setAuthSubmitting] = useState(false)
-  const [pendingPreviewPath, setPendingPreviewPath] = useState<string | null>(null)
-  const [highlightedFiles, setHighlightedFiles] = useState<Set<string>>(() =>
-    loadHighlightedFiles(),
-  )
+  const [highlightedFiles, setHighlightedFiles] = useState<Set<string>>(() => new Set())
 
   const crumbs = useMemo(() => {
     if (!currentPath) return [{ label: "/", path: "" }]
@@ -109,20 +229,50 @@ function App() {
   }, [currentPath])
 
   useEffect(() => {
-    const initialPath = pathFromLocation(window.location.pathname)
-    void loadPath(initialPath, { replaceUrl: true })
+    void bootstrapApp()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     const handlePopState = () => {
-      const nextPath = pathFromLocation(window.location.pathname)
+      const nextIsAdmin = isAdminPath(window.location.pathname)
+      setAdminRoute(nextIsAdmin)
       setPreviewEntry(null)
-      void loadPath(nextPath, { updateUrl: false })
+      if (!nextIsAdmin && user) {
+        const nextPath = pathFromLocation(window.location.pathname)
+        void loadPath(nextPath, { updateUrl: false })
+      }
     }
 
     window.addEventListener("popstate", handlePopState)
     return () => window.removeEventListener("popstate", handlePopState)
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
+
+  async function bootstrapApp() {
+    setAuthLoading(true)
+    try {
+      const me = await fetchMe()
+      applyMe(me)
+      if (me.authenticated && me.user) {
+        if (isAdminPath(window.location.pathname)) {
+          setAdminRoute(true)
+        } else {
+          await loadPath(pathFromLocation(window.location.pathname), { replaceUrl: true })
+          await loadHighlightedFilesFromServer()
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "认证状态加载失败")
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  function applyMe(me: MeResponse) {
+    setUser(me.user)
+    setNeedsBootstrap(me.needsBootstrap)
+  }
 
   async function loadPath(path: string, options: LoadPathOptions = {}) {
     const requestPath = normalizePath(path)
@@ -140,10 +290,8 @@ function App() {
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({}))) as ApiError
         if (response.status === 401 && payload.code === "AUTH_REQUIRED") {
-          setAuthPath(requestPath)
-          setAuthPassword("")
-          setAuthError("")
-          setPendingPreviewPath(requestedPreviewPath ?? null)
+          setUser(null)
+          setError("请先登录。")
           return
         }
 
@@ -168,9 +316,7 @@ function App() {
       }
 
       const payload = (await response.json()) as ListResponse
-      const safeEntries = payload.entries.filter(
-        (item) => item.name !== ".private" && item.name !== ".password",
-      )
+      const safeEntries = payload.entries.filter((item) => item.name !== ".private")
       let resolvedPreviewPath: string | null = null
       if (requestedPreviewPath !== undefined) {
         const previewCandidate = requestedPreviewPath
@@ -186,7 +332,6 @@ function App() {
 
       setEntries(safeEntries)
       setCurrentPath(payload.path)
-      setPendingPreviewPath(null)
       if (options.updateUrl !== false) {
         syncBrowserState(payload.path, resolvedPreviewPath, options.replaceUrl === true)
       }
@@ -198,41 +343,63 @@ function App() {
     }
   }
 
-  async function submitPassword(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!authPath) return
-
-    setAuthSubmitting(true)
-    setAuthError("")
-    try {
-      const response = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ path: authPath, password: authPassword }),
-      })
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as ApiError
-        throw new Error(payload.message ?? "密码校验失败。")
-      }
-
-      const targetPath = authPath
-      const targetPreviewPath = pendingPreviewPath
-      closeAuthDialog()
-      await loadPath(targetPath, { previewPath: targetPreviewPath })
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : "发生未知错误")
-    } finally {
-      setAuthSubmitting(false)
-    }
+  async function handleLogin(username: string, code: string) {
+    const payload = await apiJson<LoginResponse>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, code }),
+    })
+    setUser(payload.user)
+    setNeedsBootstrap(false)
+    setAdminRoute(false)
+    await loadHighlightedFilesFromServer()
+    await loadPath("", { replaceUrl: true })
   }
 
-  function closeAuthDialog() {
-    setAuthPath(null)
-    setAuthPassword("")
-    setAuthError("")
-    setPendingPreviewPath(null)
+  async function handleBootstrapFinish(username: string, secret: string, code: string) {
+    const payload = await apiJson<LoginResponse>("/api/bootstrap/finish", {
+      method: "POST",
+      body: JSON.stringify({ username, secret, code }),
+    })
+    setUser(payload.user)
+    setNeedsBootstrap(false)
+    setAdminRoute(false)
+    await loadHighlightedFilesFromServer()
+    await loadPath("", { replaceUrl: true })
+  }
+
+  async function logout() {
+    await apiJson<{ ok: boolean }>("/api/auth/logout", { method: "POST" })
+    setUser(null)
+    setEntries([])
+    setPreviewEntry(null)
+    setCurrentPath("")
+    setHighlightedFiles(new Set())
+    setAdminRoute(false)
+    window.history.replaceState(null, "", "/")
+  }
+
+  async function loadHighlightedFilesFromServer() {
+    const payload = await apiJson<FileStatesResponse>("/api/file-states")
+    setHighlightedFiles(
+      new Set(
+        payload.files
+          .filter((item) => item.highlighted)
+          .map((item) => normalizePath(item.path))
+          .filter((path) => path.length > 0),
+      ),
+    )
+  }
+
+  function openAdmin() {
+    setPreviewEntry(null)
+    setAdminRoute(true)
+    window.history.pushState(null, "", "/_mlist/admin")
+  }
+
+  function closeAdmin() {
+    setAdminRoute(false)
+    window.history.pushState(null, "", browserPath(currentPath))
+    void loadPath(currentPath)
   }
 
   function goParent() {
@@ -249,23 +416,28 @@ function App() {
       void loadPath(entry.path)
       return
     }
+    void markFileHighlighted(entry.path)
     setPreviewEntry(entry)
     syncBrowserState(currentPath, entry.path, false)
   }
 
   async function copyDownloadAddress(entry: ListEntry) {
-    const url = toAbsoluteUrl(fileUrl(entry.path))
     try {
+      const payload = await apiJson<SignedFileLinkResponse>("/api/file-link", {
+        method: "POST",
+        body: JSON.stringify({ path: entry.path }),
+      })
+      const url = toAbsoluteUrl(payload.url)
       await navigator.clipboard.writeText(url)
-      markFileHighlighted(entry.path)
-      toast.success("链接已复制")
+      await markFileHighlighted(entry.path)
+      toast.success("7 天播放链接已复制")
     } catch {
       toast.error("复制失败，请检查浏览器剪贴板权限。")
     }
   }
 
   function downloadFile(entry: ListEntry) {
-    markFileHighlighted(entry.path)
+    void markFileHighlighted(entry.path)
     const anchor = document.createElement("a")
     anchor.href = fileUrl(entry.path)
     anchor.download = entry.name
@@ -279,35 +451,86 @@ function App() {
     return highlightedFiles.has(normalizePath(path))
   }
 
-  function markFileHighlighted(path: string) {
+  async function markFileHighlighted(path: string) {
     const normalizedPath = normalizePath(path)
     if (!normalizedPath) return
 
+    await setFileHighlighted(normalizedPath, true)
     setHighlightedFiles((previous) => {
       if (previous.has(normalizedPath)) return previous
       const next = new Set(previous)
       next.add(normalizedPath)
-      saveHighlightedFiles(next)
       return next
     })
   }
 
-  function unmarkFileHighlighted(path: string) {
+  async function unmarkFileHighlighted(path: string) {
     const normalizedPath = normalizePath(path)
     if (!normalizedPath) return
 
+    await setFileHighlighted(normalizedPath, false)
     setHighlightedFiles((previous) => {
       if (!previous.has(normalizedPath)) return previous
       const next = new Set(previous)
       next.delete(normalizedPath)
-      saveHighlightedFiles(next)
       return next
     })
   }
 
+  async function setFileHighlighted(path: string, highlighted: boolean) {
+    await apiJson<FileState>("/api/file-states", {
+      method: "POST",
+      body: JSON.stringify({ path, highlighted }),
+    })
+  }
+
+  if (authLoading) {
+    return (
+      <Shell>
+        <p className="text-muted-foreground px-3 py-4 text-sm">正在加载...</p>
+      </Shell>
+    )
+  }
+
+  if (!user && needsBootstrap) {
+    return (
+      <Shell>
+        <BootstrapView onFinish={handleBootstrapFinish} />
+      </Shell>
+    )
+  }
+
+  if (!user) {
+    return (
+      <Shell>
+        <LoginView onLogin={handleLogin} />
+      </Shell>
+    )
+  }
+
+  if (adminRoute) {
+    return (
+      <Shell>
+        <TopBar
+          user={user}
+          onAdmin={openAdmin}
+          onLogout={() => void logout()}
+          onBack={closeAdmin}
+          adminMode
+        />
+        <AdminView currentUser={user} onUserChanged={setUser} />
+      </Shell>
+    )
+  }
+
   if (previewEntry) {
     return (
-      <div className="mx-auto w-full max-w-6xl px-4 py-2">
+      <Shell>
+        <TopBar
+          user={user}
+          onAdmin={openAdmin}
+          onLogout={() => void logout()}
+        />
         <div className="mb-3 flex items-center gap-2">
           <Button
             variant="outline"
@@ -364,22 +587,17 @@ function App() {
         <Card className="py-1">
           <CardContent className="p-2">{renderPreview(previewEntry, fileUrl(previewEntry.path))}</CardContent>
         </Card>
-
-        <AuthDialog
-          authPath={authPath}
-          authPassword={authPassword}
-          authError={authError}
-          authSubmitting={authSubmitting}
-          onPasswordChange={setAuthPassword}
-          onClose={closeAuthDialog}
-          onSubmit={submitPassword}
-        />
-      </div>
+      </Shell>
     )
   }
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-4 py-2">
+    <Shell>
+      <TopBar
+        user={user}
+        onAdmin={openAdmin}
+        onLogout={() => void logout()}
+      />
       <div className="mb-3 flex items-center gap-2">
         <Button
           variant="outline"
@@ -457,7 +675,7 @@ function App() {
                             复制链接
                           </ContextMenuItem>
                           {highlighted ? (
-                            <ContextMenuItem onSelect={() => unmarkFileHighlighted(entry.path)}>
+                            <ContextMenuItem onSelect={() => void unmarkFileHighlighted(entry.path)}>
                               <CircleOffIcon className="mr-2 size-4" />
                               取消高亮
                             </ContextMenuItem>
@@ -474,17 +692,756 @@ function App() {
           )}
         </CardContent>
       </Card>
+    </Shell>
+  )
+}
 
-      <AuthDialog
-        authPath={authPath}
-        authPassword={authPassword}
-        authError={authError}
-        authSubmitting={authSubmitting}
-        onPasswordChange={setAuthPassword}
-        onClose={closeAuthDialog}
-        onSubmit={submitPassword}
-      />
+function Shell({ children }: { children: ReactNode }) {
+  return <div className="mx-auto w-full max-w-6xl px-4 py-3">{children}</div>
+}
+
+function TopBar({
+  user,
+  adminMode = false,
+  onAdmin,
+  onLogout,
+  onBack,
+}: {
+  user: UserView
+  adminMode?: boolean
+  onAdmin: () => void
+  onLogout: () => void
+  onBack?: () => void
+}) {
+  return (
+    <div className="mb-3 flex items-center gap-2 border-b pb-3">
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-sm font-medium">{user.username}</span>
+          {user.role === "admin" ? <Badge>管理员</Badge> : null}
+          <Badge variant="outline" title="本用户累计流量">
+            <DownloadIcon className="size-3" />
+            {formatBytes(user.totalBytesServed, 2)}
+          </Badge>
+        </div>
+      </div>
+      {adminMode ? (
+        <Button variant="outline" size="icon" onClick={onBack} aria-label="返回文件" title="返回文件">
+          <ArrowLeftIcon className="size-4" />
+        </Button>
+      ) : user.role === "admin" ? (
+        <Button variant="outline" size="icon" onClick={onAdmin} aria-label="用户管理" title="用户管理">
+          <SettingsIcon className="size-4" />
+        </Button>
+      ) : null}
+      <Button variant="outline" size="icon" onClick={onLogout} aria-label="退出登录" title="退出登录">
+        <LogOutIcon className="size-4" />
+      </Button>
     </div>
+  )
+}
+
+function LoginView({ onLogin }: { onLogin: (username: string, code: string) => Promise<void> }) {
+  const [username, setUsername] = useState("")
+  const [code, setCode] = useState("")
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState("")
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmitting(true)
+    setError("")
+    try {
+      await onLogin(username, code)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登录失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-sm pt-16">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <KeyRoundIcon className="size-5" />
+            登录
+          </CardTitle>
+          <CardDescription>使用用户名和 6 位动态码访问文件。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form className="space-y-4" onSubmit={(event) => void submit(event)}>
+            <div className="space-y-2">
+              <Label htmlFor="login-username">用户名</Label>
+              <Input
+                id="login-username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                autoFocus
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="login-code">动态码</Label>
+              <Input
+                id="login-code"
+                inputMode="numeric"
+                pattern="[0-9]{6}"
+                maxLength={6}
+                value={code}
+                onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                required
+              />
+            </div>
+            {error ? (
+              <Alert variant="destructive">
+                <AlertCircleIcon className="size-4" />
+                <AlertTitle>登录失败</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            ) : null}
+            <Button type="submit" className="w-full" disabled={submitting}>
+              {submitting ? "登录中..." : "登录"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function BootstrapView({
+  onFinish,
+}: {
+  onFinish: (username: string, secret: string, code: string) => Promise<void>
+}) {
+  const [username, setUsername] = useState("")
+  const [code, setCode] = useState("")
+  const [binding, setBinding] = useState<BootstrapStartResponse | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState("")
+
+  async function start(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmitting(true)
+    setError("")
+    try {
+      const payload = await apiJson<BootstrapStartResponse>("/api/bootstrap/start", {
+        method: "POST",
+        body: JSON.stringify({ username }),
+      })
+      setBinding(payload)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "初始化失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function finish(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!binding) return
+    setSubmitting(true)
+    setError("")
+    try {
+      await onFinish(binding.username, binding.secret, code)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "动态码验证失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-md pt-10">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldIcon className="size-5" />
+            初始化管理员
+          </CardTitle>
+          <CardDescription>空库首次绑定的账号会成为管理员。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {!binding ? (
+            <form className="space-y-4" onSubmit={(event) => void start(event)}>
+              <div className="space-y-2">
+                <Label htmlFor="bootstrap-username">管理员用户名</Label>
+                <Input
+                  id="bootstrap-username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoFocus
+                  required
+                />
+              </div>
+              {error ? <FormError title="初始化失败" message={error} /> : null}
+              <Button type="submit" className="w-full" disabled={submitting}>
+                {submitting ? "生成中..." : "生成 TOTP"}
+              </Button>
+            </form>
+          ) : (
+            <form className="space-y-4" onSubmit={(event) => void finish(event)}>
+              <TotpBindingPanel binding={binding} />
+              <div className="space-y-2">
+                <Label htmlFor="bootstrap-code">动态码</Label>
+                <Input
+                  id="bootstrap-code"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={code}
+                  onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                  required
+                />
+              </div>
+              {error ? <FormError title="验证失败" message={error} /> : null}
+              <Button type="submit" className="w-full" disabled={submitting}>
+                {submitting ? "验证中..." : "完成初始化"}
+              </Button>
+            </form>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function AdminView({
+  currentUser,
+  onUserChanged,
+}: {
+  currentUser: UserView
+  onUserChanged: (user: UserView) => void
+}) {
+  const [users, setUsers] = useState<UserView[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+  const [createOpen, setCreateOpen] = useState(false)
+  const [binding, setBinding] = useState<TotpBinding | null>(null)
+  const [auditUserId, setAuditUserId] = useState("all")
+
+  useEffect(() => {
+    void loadUsers()
+  }, [])
+
+  async function loadUsers() {
+    setLoading(true)
+    setError("")
+    try {
+      const payload = await apiJson<UsersResponse>("/api/admin/users")
+      setUsers(payload.users)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "用户加载失败")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function toggleUser(target: UserView) {
+    const action = target.enabled ? "disable" : "enable"
+    try {
+      const updated = await apiJson<UserView>(`/api/admin/users/${target.id}/${action}`, {
+        method: "POST",
+      })
+      setUsers((previous) => previous.map((item) => (item.id === updated.id ? updated : item)))
+      if (updated.id === currentUser.id) onUserChanged(updated)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "操作失败")
+    }
+  }
+
+  async function resetTotp(target: UserView) {
+    try {
+      const payload = await apiJson<TotpBinding>(`/api/admin/users/${target.id}/reset-totp`, {
+        method: "POST",
+      })
+      setBinding(payload)
+      await loadUsers()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "重置失败")
+    }
+  }
+
+  async function deleteUser(target: UserView) {
+    if (target.id === currentUser.id) {
+      toast.error("不能删除当前登录用户。")
+      return
+    }
+    if (!window.confirm(`确定删除用户「${target.username}」？相关会话、审计和文件状态也会删除。`)) {
+      return
+    }
+
+    try {
+      await apiJson<{ ok: boolean }>(`/api/admin/users/${target.id}`, {
+        method: "DELETE",
+      })
+      setUsers((previous) => previous.filter((item) => item.id !== target.id))
+      if (auditUserId === String(target.id)) setAuditUserId("all")
+      toast.success("用户已删除")
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "删除失败")
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <h1 className="text-lg font-semibold">管理</h1>
+          <p className="text-muted-foreground text-sm">用户、资源访问审计和文件进度。</p>
+        </div>
+      </div>
+      {error ? <FormError title="请求失败" message={error} /> : null}
+      <Tabs defaultValue="users" className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <TabsList>
+            <TabsTrigger value="users">
+              <UserPlusIcon className="size-4" />
+              用户
+            </TabsTrigger>
+            <TabsTrigger value="audit">
+              <ActivityIcon className="size-4" />
+              审计
+            </TabsTrigger>
+          </TabsList>
+          <div className="flex-1" />
+          <Button onClick={() => setCreateOpen(true)}>
+            <UserPlusIcon className="size-4" />
+            新建用户
+          </Button>
+        </div>
+        <TabsContent value="users" className="space-y-3">
+          <Card className="py-1">
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>用户名</TableHead>
+                    <TableHead>角色</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead className="hidden md:table-cell">最后登录</TableHead>
+                    <TableHead className="hidden lg:table-cell">最后使用</TableHead>
+                    <TableHead className="hidden sm:table-cell">总流量</TableHead>
+                    <TableHead className="text-right">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {loading ? (
+                    <TableRow>
+                      <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
+                        正在加载用户...
+                      </TableCell>
+                    </TableRow>
+                  ) : users.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
+                        暂无用户
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    users.map((item) => (
+                      <TableRow key={item.id}>
+                        <TableCell className="font-medium">{item.username}</TableCell>
+                        <TableCell>
+                          <Badge variant={item.role === "admin" ? "default" : "secondary"}>
+                            {item.role === "admin" ? "管理员" : "用户"}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant={item.enabled ? "outline" : "destructive"}>
+                            {item.enabled ? "启用" : "禁用"}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-muted-foreground hidden md:table-cell">
+                          {item.lastLoginAt ? formatDate(item.lastLoginAt) : "--"}
+                        </TableCell>
+                        <TableCell className="text-muted-foreground hidden lg:table-cell">
+                          {item.lastSeenAt ? formatDate(item.lastSeenAt) : "--"}
+                        </TableCell>
+                        <TableCell className="text-muted-foreground hidden sm:table-cell">
+                          {formatBytes(item.totalBytesServed)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              variant="outline"
+                              size="icon-sm"
+                              onClick={() => void resetTotp(item)}
+                              aria-label="重置 TOTP"
+                              title="重置 TOTP"
+                            >
+                              <KeyRoundIcon className="size-4" />
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="icon-sm"
+                              onClick={() => void toggleUser(item)}
+                              aria-label={item.enabled ? "禁用用户" : "启用用户"}
+                              title={item.enabled ? "禁用用户" : "启用用户"}
+                            >
+                              {item.enabled ? (
+                                <BanIcon className="size-4" />
+                              ) : (
+                                <CheckCircleIcon className="size-4" />
+                              )}
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="icon-sm"
+                              onClick={() => void deleteUser(item)}
+                              aria-label="删除用户"
+                              title="删除用户"
+                              disabled={item.id === currentUser.id}
+                            >
+                              <Trash2Icon className="size-4" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  )}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="audit" className="space-y-3">
+          <AuditView users={users} selectedUserId={auditUserId} onUserChange={setAuditUserId} />
+        </TabsContent>
+      </Tabs>
+      <CreateUserDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={(payload) => {
+          setBinding(payload)
+          setCreateOpen(false)
+          void loadUsers()
+        }}
+      />
+      <BindingDialog binding={binding} onClose={() => setBinding(null)} />
+    </div>
+  )
+}
+
+function AuditView({
+  users,
+  selectedUserId,
+  onUserChange,
+}: {
+  users: UserView[]
+  selectedUserId: string
+  onUserChange: (value: string) => void
+}) {
+  const [events, setEvents] = useState<ResourceAccessEvent[]>([])
+  const [resources, setResources] = useState<ResourceUsage[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    void loadAudit()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUserId])
+
+  async function loadAudit() {
+    setLoading(true)
+    setError("")
+    try {
+      const query = selectedUserId === "all" ? "limit=100" : `userId=${selectedUserId}&limit=100`
+      const [eventsPayload, resourcesPayload] = await Promise.all([
+        apiJson<AuditEventsResponse>(`/api/admin/audit/events?${query}`),
+        apiJson<AuditResourcesResponse>(`/api/admin/audit/resources?${query}`),
+      ])
+      setEvents(eventsPayload.events)
+      setResources(resourcesPayload.resources)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "审计数据加载失败")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={selectedUserId} onValueChange={onUserChange}>
+          <SelectTrigger className="w-full sm:w-56">
+            <SelectValue placeholder="选择用户" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部用户</SelectItem>
+            {users.map((user) => (
+              <SelectItem key={user.id} value={String(user.id)}>
+                {user.username}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button variant="outline" onClick={() => void loadAudit()} disabled={loading}>
+          <RefreshCwIcon className={`size-4 ${loading ? "animate-spin" : ""}`} />
+          刷新
+        </Button>
+      </div>
+      {error ? <FormError title="审计加载失败" message={error} /> : null}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <ListChecksIcon className="size-4" />
+            文件进度
+          </CardTitle>
+          <CardDescription>淡绿色背景表示该用户对文件的最高请求位置估算。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {loading && resources.length === 0 ? (
+            <p className="text-muted-foreground py-6 text-center text-sm">正在加载文件进度...</p>
+          ) : resources.length === 0 ? (
+            <p className="text-muted-foreground rounded-md border border-dashed px-3 py-4 text-center text-sm">
+              暂无文件访问记录
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {resources.map((resource) => (
+                <ResourceProgressRow
+                  key={`${resource.userId}:${resource.path}`}
+                  resource={resource}
+                  showUser={selectedUserId === "all"}
+                />
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
+      <Card className="py-1">
+        <CardHeader className="px-4 py-3">
+          <CardTitle className="text-base">最近访问</CardTitle>
+          <CardDescription>最近 90 天内成功访问的目录和文件。</CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>时间</TableHead>
+                <TableHead>用户</TableHead>
+                <TableHead>类型</TableHead>
+                <TableHead>路径</TableHead>
+                <TableHead className="hidden md:table-cell">Range</TableHead>
+                <TableHead className="text-right">流量</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {loading && events.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
+                    正在加载访问记录...
+                  </TableCell>
+                </TableRow>
+              ) : events.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
+                    暂无访问记录
+                  </TableCell>
+                </TableRow>
+              ) : (
+                events.map((event) => (
+                  <TableRow key={event.id}>
+                    <TableCell className="text-muted-foreground whitespace-nowrap">
+                      {formatDate(event.createdAt)}
+                    </TableCell>
+                    <TableCell>{event.username}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline">
+                        {event.resourceKind === "file" ? "文件" : "目录"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="max-w-[22rem] truncate font-mono text-xs">
+                      {event.path || "/"}
+                    </TableCell>
+                    <TableCell className="text-muted-foreground hidden font-mono text-xs md:table-cell">
+                      {formatRange(event.rangeStart, event.rangeEnd)}
+                    </TableCell>
+                    <TableCell className="text-right text-muted-foreground">
+                      {formatBytes(event.bytesServed)}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function ResourceProgressRow({
+  resource,
+  showUser,
+}: {
+  resource: ResourceUsage
+  showUser: boolean
+}) {
+  const progress = Math.round((resource.progress ?? 0) * 1000) / 10
+  const progressWidth = Math.min(100, Math.max(0, progress))
+  const background = `linear-gradient(90deg, rgba(187, 247, 208, 0.65) 0%, rgba(187, 247, 208, 0.65) ${progressWidth}%, transparent ${progressWidth}%, transparent 100%)`
+
+  return (
+    <li
+      className="overflow-hidden rounded-md border px-3 py-2"
+      style={{ background }}
+      title={`${resource.path} · ${formatPercent(resource.progress)}`}
+    >
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">{resource.path}</span>
+        <span className="text-sm font-medium">{formatPercent(resource.progress)}</span>
+      </div>
+      <div className="text-muted-foreground mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+        {showUser ? <span>{resource.username}</span> : null}
+        <span>{formatBytes(resource.totalBytesServed)}</span>
+        <span>{resource.accessCount} 次访问</span>
+        <span>{formatDate(resource.lastAccessAt)}</span>
+        <span>{formatRange(resource.lastRangeStart, resource.lastRangeEnd)}</span>
+      </div>
+    </li>
+  )
+}
+
+function CreateUserDialog({
+  open,
+  onOpenChange,
+  onCreated,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onCreated: (binding: TotpBinding) => void
+}) {
+  const [username, setUsername] = useState("")
+  const [role, setRole] = useState<UserRole>("user")
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState("")
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmitting(true)
+    setError("")
+    try {
+      const payload = await apiJson<TotpBinding>("/api/admin/users", {
+        method: "POST",
+        body: JSON.stringify({ username, role }),
+      })
+      setUsername("")
+      setRole("user")
+      onCreated(payload)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "创建失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>新建用户</DialogTitle>
+          <DialogDescription>创建后会显示一次 TOTP 绑定二维码。</DialogDescription>
+        </DialogHeader>
+        <form className="space-y-4" onSubmit={(event) => void submit(event)}>
+          <div className="space-y-2">
+            <Label htmlFor="create-username">用户名</Label>
+            <Input
+              id="create-username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              autoFocus
+              required
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>角色</Label>
+            <Select value={role} onValueChange={(value) => setRole(value as UserRole)}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="user">用户</SelectItem>
+                <SelectItem value="admin">管理员</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {error ? <FormError title="创建失败" message={error} /> : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+              取消
+            </Button>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? "创建中..." : "创建"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function BindingDialog({ binding, onClose }: { binding: TotpBinding | null; onClose: () => void }) {
+  return (
+    <Dialog open={Boolean(binding)} onOpenChange={(open) => (!open ? onClose() : undefined)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>TOTP 绑定</DialogTitle>
+          <DialogDescription>该二维码和密钥只在本次操作后展示。</DialogDescription>
+        </DialogHeader>
+        {binding ? <TotpBindingPanel binding={binding} /> : null}
+        <DialogFooter>
+          <Button onClick={onClose}>完成</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function TotpBindingPanel({
+  binding,
+}: {
+  binding: { username?: string; secret: string; otpauthUrl: string; qrDataUrl: string; user?: UserView }
+}) {
+  const label = binding.user?.username ?? binding.username ?? "user"
+
+  async function copySecret() {
+    try {
+      await navigator.clipboard.writeText(binding.secret)
+      toast.success("密钥已复制")
+    } catch {
+      toast.error("复制失败，请检查浏览器剪贴板权限。")
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex justify-center rounded-md border bg-white p-4">
+        <img src={binding.qrDataUrl} alt={`${label} TOTP QR`} className="size-48" />
+      </div>
+      <div className="space-y-2">
+        <Label>密钥</Label>
+        <div className="flex gap-2">
+          <Input value={binding.secret} readOnly className="font-mono text-xs" />
+          <Button type="button" variant="outline" size="icon" onClick={() => void copySecret()}>
+            <CopyIcon className="size-4" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FormError({ title, message }: { title: string; message: string }) {
+  return (
+    <Alert variant="destructive">
+      <AlertCircleIcon className="size-4" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>{message}</AlertDescription>
+    </Alert>
   )
 }
 
@@ -586,61 +1543,32 @@ function EntryRow({
   )
 }
 
-function AuthDialog({
-  authPath,
-  authPassword,
-  authError,
-  authSubmitting,
-  onPasswordChange,
-  onClose,
-  onSubmit,
-}: {
-  authPath: string | null
-  authPassword: string
-  authError: string
-  authSubmitting: boolean
-  onPasswordChange: (value: string) => void
-  onClose: () => void
-  onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void>
-}) {
-  return (
-    <Dialog open={Boolean(authPath)} onOpenChange={(open) => (!open ? onClose() : undefined)}>
-      <DialogContent showCloseButton={false} className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>私有目录</DialogTitle>
-          <DialogDescription>
-            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{authPath || "/"}</code>
-            {" 需要密码访问。"}
-          </DialogDescription>
-        </DialogHeader>
-        <form className="space-y-3" onSubmit={(event) => void onSubmit(event)}>
-          <Input
-            type="password"
-            value={authPassword}
-            onChange={(event) => onPasswordChange(event.target.value)}
-            placeholder="请输入密码"
-            autoFocus
-            required
-          />
-          {authError ? (
-            <Alert variant="destructive">
-              <AlertCircleIcon className="size-4" />
-              <AlertTitle>认证失败</AlertTitle>
-              <AlertDescription>{authError}</AlertDescription>
-            </Alert>
-          ) : null}
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              取消
-            </Button>
-            <Button type="submit" disabled={authSubmitting}>
-              {authSubmitting ? "验证中..." : "解锁"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
+async function fetchMe(): Promise<MeResponse> {
+  return apiJson<MeResponse>("/api/me")
+}
+
+async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers)
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json")
+  }
+
+  const response = await fetch(url, {
+    ...init,
+    headers,
+    credentials: "include",
+  })
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as ApiError
+    throw new Error(payload.message ?? `请求失败（${response.status}）`)
+  }
+
+  return (await response.json()) as T
+}
+
+function isAdminPath(pathname: string): boolean {
+  return normalizePath(pathname) === "_mlist/admin"
 }
 
 function fileUrl(path: string): string {
@@ -675,29 +1603,6 @@ function parentPathOf(path: string): string {
   const parts = normalized.split("/")
   parts.pop()
   return parts.join("/")
-}
-
-function loadHighlightedFiles(): Set<string> {
-  if (typeof window === "undefined") return new Set()
-  const raw = window.localStorage.getItem(HIGHLIGHTED_FILES_STORAGE_KEY)
-  if (!raw) return new Set()
-
-  try {
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return new Set()
-
-    const normalized = parsed
-      .map((value) => (typeof value === "string" ? normalizePath(value) : ""))
-      .filter((value) => value.length > 0)
-    return new Set(normalized)
-  } catch {
-    return new Set()
-  }
-}
-
-function saveHighlightedFiles(paths: Set<string>) {
-  if (typeof window === "undefined") return
-  window.localStorage.setItem(HIGHLIGHTED_FILES_STORAGE_KEY, JSON.stringify(Array.from(paths)))
 }
 
 function pathFromLocation(pathname: string): string {
@@ -738,8 +1643,10 @@ function toAbsoluteUrl(url: string): string {
   return new URL(url, window.location.origin).toString()
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
+function formatBytes(bytes: number, fractionDigits?: number): string {
+  if (bytes < 1024) {
+    return fractionDigits == null ? `${bytes} B` : `${bytes.toFixed(fractionDigits)} B`
+  }
   const units = ["KB", "MB", "GB", "TB"]
   let size = bytes / 1024
   let unit = 0
@@ -747,7 +1654,17 @@ function formatBytes(bytes: number): string {
     size /= 1024
     unit += 1
   }
-  return `${size.toFixed(1)} ${units[unit]}`
+  return `${size.toFixed(fractionDigits ?? 1)} ${units[unit]}`
+}
+
+function formatPercent(value: number | null | undefined): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "--"
+  return `${(Math.min(1, Math.max(0, value)) * 100).toFixed(1)}%`
+}
+
+function formatRange(start: number | null | undefined, end: number | null | undefined): string {
+  if (typeof start !== "number" || typeof end !== "number") return "--"
+  return `${formatBytes(start)}-${formatBytes(end)}`
 }
 
 function formatDate(unixSeconds: number): string {
@@ -839,8 +1756,9 @@ function useRemoteTextContent(previewUrl: string) {
         setError(err instanceof Error ? err.message : "加载文本失败。")
         setContent("")
       } finally {
-        if (!active) return
-        setLoading(false)
+        if (active) {
+          setLoading(false)
+        }
       }
     }
 

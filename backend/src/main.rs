@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod db;
 mod errors;
 mod handlers;
 mod path_guard;
@@ -13,13 +14,16 @@ use axum::Json;
 use axum::Router;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{any, get, get_service, post};
+use axum::routing::{any, delete, get, get_service, post};
 use handlers::{
-    AppState, direct_file_handler, file_handler, list_handler, login_handler, logout_handler,
-    me_handler,
+    AppState, admin_audit_events_handler, admin_audit_resources_handler, admin_create_user_handler,
+    admin_delete_user_handler, admin_disable_user_handler, admin_enable_user_handler,
+    admin_reset_totp_handler, admin_users_handler, bootstrap_finish_handler,
+    bootstrap_start_handler, create_file_link_handler, direct_file_handler, file_states_handler,
+    list_handler, login_handler, logout_handler, me_handler, set_file_state_handler,
 };
 use serde_json::json;
-use session::{LoginRateLimiter, SessionStore};
+use session::LoginRateLimiter;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -43,6 +47,14 @@ async fn main() {
         }
     };
 
+    let db = match db::AuthDb::connect(&config.database_path).await {
+        Ok(value) => value,
+        Err(err) => {
+            error!("{err}");
+            std::process::exit(1);
+        }
+    };
+
     let csp_header_value = HeaderValue::from_str(&config.content_security_policy)
         .unwrap_or_else(|_| HeaderValue::from_static("default-src 'self'"));
     let content_security_policy = HeaderName::from_static("content-security-policy");
@@ -51,17 +63,41 @@ async fn main() {
     let referrer_policy = HeaderName::from_static("referrer-policy");
     let state = AppState {
         config: config.clone(),
-        sessions: SessionStore::new(),
+        db,
         login_limiter: LoginRateLimiter::new(config.login_max_failures, config.login_block_seconds),
     };
 
     let app = Router::new()
         .route("/api/list", get(list_handler))
-        .route("/api/file", get(file_handler))
         .route("/d/{*path}", get(direct_file_handler))
+        .route("/api/bootstrap/start", post(bootstrap_start_handler))
+        .route("/api/bootstrap/finish", post(bootstrap_finish_handler))
         .route("/api/auth/login", post(login_handler))
         .route("/api/auth/logout", post(logout_handler))
         .route("/api/me", get(me_handler))
+        .route("/api/file-link", post(create_file_link_handler))
+        .route("/api/file-states", get(file_states_handler))
+        .route("/api/file-states", post(set_file_state_handler))
+        .route("/api/admin/users", get(admin_users_handler))
+        .route("/api/admin/users", post(admin_create_user_handler))
+        .route("/api/admin/users/{id}", delete(admin_delete_user_handler))
+        .route("/api/admin/audit/events", get(admin_audit_events_handler))
+        .route(
+            "/api/admin/audit/resources",
+            get(admin_audit_resources_handler),
+        )
+        .route(
+            "/api/admin/users/{id}/disable",
+            post(admin_disable_user_handler),
+        )
+        .route(
+            "/api/admin/users/{id}/enable",
+            post(admin_enable_user_handler),
+        )
+        .route(
+            "/api/admin/users/{id}/reset-totp",
+            post(admin_reset_totp_handler),
+        )
         .route("/api", any(api_not_found_handler))
         .route("/api/{*path}", any(api_not_found_handler))
         .layer(SetResponseHeaderLayer::if_not_present(

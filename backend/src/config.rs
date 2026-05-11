@@ -6,6 +6,8 @@ pub struct AppConfig {
     pub database_path: PathBuf,
     pub bind_addr: String,
     pub session_ttl_seconds: u64,
+    pub access_ttl_seconds: u64,
+    pub refresh_ttl_seconds: u64,
     pub signed_file_link_ttl_seconds: u64,
     pub login_max_failures: u32,
     pub login_block_seconds: u64,
@@ -19,6 +21,8 @@ impl Default for AppConfig {
             database_path: PathBuf::from("/mlist-data/mlist.sqlite3"),
             bind_addr: "0.0.0.0:3000".to_string(),
             session_ttl_seconds: 2_592_000,
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 2_592_000,
             signed_file_link_ttl_seconds: 604_800,
             login_max_failures: 5,
             login_block_seconds: 60,
@@ -78,6 +82,13 @@ impl AppConfig {
         }
         if let Some(value) = read_env_u64("MLIST_SESSION_TTL_SECONDS")? {
             self.session_ttl_seconds = value;
+            self.refresh_ttl_seconds = value;
+        }
+        if let Some(value) = read_env_u64("MLIST_ACCESS_TTL_SECONDS")? {
+            self.access_ttl_seconds = value;
+        }
+        if let Some(value) = read_env_u64("MLIST_REFRESH_TTL_SECONDS")? {
+            self.refresh_ttl_seconds = value;
         }
         if let Some(value) = read_env_u64("MLIST_SIGNED_FILE_LINK_TTL_SECONDS")? {
             self.signed_file_link_ttl_seconds = value;

@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::RwLock;
 
-pub const SESSION_COOKIE_NAME: &str = "mlist_sid";
+pub const REFRESH_COOKIE_NAME: &str = "mlist_refresh";
 
 #[derive(Debug, Clone)]
 pub struct LoginRateLimiter {

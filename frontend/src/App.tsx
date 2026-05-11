@@ -118,14 +118,24 @@ type UserView = {
 type MeResponse = {
   authenticated: boolean
   user: UserView | null
-  expiresAt: string | null
+  accessExpiresAt: string | null
   needsBootstrap: boolean
 }
 
 type LoginResponse = {
   ok: boolean
   user: UserView
-  expiresAt: string
+  accessToken: string
+  accessExpiresAt: string
+  refreshExpiresAt: string
+}
+
+type RefreshResponse = {
+  ok: boolean
+  user: UserView
+  accessToken: string
+  accessExpiresAt: string
+  refreshExpiresAt: string
 }
 
 type TotpBinding = {
@@ -216,6 +226,13 @@ type LoadPathOptions = {
 const AUDIT_PAGE_SIZE = 50
 const TOTP_CODE_LENGTH = 6
 
+let accessToken: string | null = null
+let refreshPromise: Promise<RefreshResponse> | null = null
+
+function setAccessToken(token: string | null) {
+  accessToken = token
+}
+
 function App() {
   const [authLoading, setAuthLoading] = useState(true)
   const [user, setUser] = useState<UserView | null>(null)
@@ -264,6 +281,10 @@ function App() {
   async function bootstrapApp() {
     setAuthLoading(true)
     try {
+      const refreshed = await refreshAccessToken().catch(() => null)
+      if (refreshed) {
+        setAccessToken(refreshed.accessToken)
+      }
       const me = await fetchMe()
       applyMe(me)
       if (me.authenticated && me.user) {
@@ -295,39 +316,7 @@ function App() {
     setError("")
 
     try {
-      const response = await fetch(`/api/list?path=${encodeURIComponent(requestPath)}`, {
-        credentials: "include",
-      })
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as ApiError
-        if (response.status === 401 && payload.code === "AUTH_REQUIRED") {
-          setUser(null)
-          setError("请先登录。")
-          return
-        }
-
-        const isPathFile =
-          allowPathAsFile &&
-          response.status === 400 &&
-          payload.code === "BAD_REQUEST" &&
-          payload.message?.includes("not a directory") &&
-          requestPath.length > 0
-        if (isPathFile) {
-          const parentPath = parentPathOf(requestPath)
-          await loadPath(parentPath, {
-            updateUrl: options.updateUrl,
-            replaceUrl: options.replaceUrl,
-            previewPath: requestPath,
-            allowPathAsFile: false,
-          })
-          return
-        }
-
-        throw new Error(payload.message ?? `加载目录失败（${response.status}）`)
-      }
-
-      const payload = (await response.json()) as ListResponse
+      const payload = await apiJson<ListResponse>(`/api/list?path=${encodeURIComponent(requestPath)}`)
       const safeEntries = payload.entries.filter((item) => item.name !== ".private")
       let resolvedPreviewPath: string | null = null
       if (requestedPreviewPath !== undefined) {
@@ -348,6 +337,23 @@ function App() {
         syncBrowserState(payload.path, resolvedPreviewPath, options.replaceUrl === true)
       }
     } catch (err) {
+      if (
+        err instanceof ApiRequestError &&
+        allowPathAsFile &&
+        err.status === 400 &&
+        err.code === "BAD_REQUEST" &&
+        err.message.includes("not a directory") &&
+        requestPath.length > 0
+      ) {
+        const parentPath = parentPathOf(requestPath)
+        await loadPath(parentPath, {
+          updateUrl: options.updateUrl,
+          replaceUrl: options.replaceUrl,
+          previewPath: requestPath,
+          allowPathAsFile: false,
+        })
+        return
+      }
       setError(err instanceof Error ? err.message : "发生未知错误")
       setEntries([])
     } finally {
@@ -360,6 +366,7 @@ function App() {
       method: "POST",
       body: JSON.stringify({ username, code }),
     })
+    setAccessToken(payload.accessToken)
     setUser(payload.user)
     setNeedsBootstrap(false)
     setAdminRoute(false)
@@ -372,6 +379,7 @@ function App() {
       method: "POST",
       body: JSON.stringify({ username, secret, code }),
     })
+    setAccessToken(payload.accessToken)
     setUser(payload.user)
     setNeedsBootstrap(false)
     setAdminRoute(false)
@@ -381,6 +389,7 @@ function App() {
 
   async function logout() {
     await apiJson<{ ok: boolean }>("/api/auth/logout", { method: "POST" })
+    setAccessToken(null)
     setUser(null)
     setEntries([])
     setPreviewEntry(null)
@@ -435,10 +444,7 @@ function App() {
 
   async function copyDownloadAddress(entry: ListEntry) {
     try {
-      const payload = await apiJson<SignedFileLinkResponse>("/api/file-link", {
-        method: "POST",
-        body: JSON.stringify({ path: entry.path }),
-      })
+      const payload = await createSignedFileLink(entry.path)
       const url = toAbsoluteUrl(payload.url)
       await navigator.clipboard.writeText(url)
       await markFileHighlighted(entry.path)
@@ -448,10 +454,11 @@ function App() {
     }
   }
 
-  function downloadFile(entry: ListEntry) {
+  async function downloadFile(entry: ListEntry) {
+    const payload = await createSignedFileLink(entry.path)
     void markFileHighlighted(entry.path)
     const anchor = document.createElement("a")
-    anchor.href = fileUrl(entry.path)
+    anchor.href = payload.url
     anchor.download = entry.name
     anchor.rel = "noreferrer"
     document.body.appendChild(anchor)
@@ -580,7 +587,7 @@ function App() {
           <Button
             variant="outline"
             size="icon"
-            onClick={() => downloadFile(previewEntry)}
+            onClick={() => void downloadFile(previewEntry)}
             aria-label="下载文件"
             title="下载文件"
           >
@@ -597,7 +604,7 @@ function App() {
         ) : null}
 
         <Card className="py-1">
-          <CardContent className="p-2">{renderPreview(previewEntry, fileUrl(previewEntry.path))}</CardContent>
+          <CardContent className="p-2"><FilePreview entry={previewEntry} /></CardContent>
         </Card>
       </Shell>
     )
@@ -678,7 +685,7 @@ function App() {
                             <EyeIcon className="mr-2 size-4" />
                             预览
                           </ContextMenuItem>
-                          <ContextMenuItem onSelect={() => downloadFile(entry)}>
+                          <ContextMenuItem onSelect={() => void downloadFile(entry)}>
                             <DownloadIcon className="mr-2 size-4" />
                             下载
                           </ContextMenuItem>
@@ -1746,10 +1753,51 @@ async function fetchMe(): Promise<MeResponse> {
   return apiJson<MeResponse>("/api/me")
 }
 
-async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
+class ApiRequestError extends Error {
+  status: number
+  code?: string
+
+  constructor(status: number, message: string, code?: string) {
+    super(message)
+    this.name = "ApiRequestError"
+    this.status = status
+    this.code = code
+  }
+}
+
+async function refreshAccessToken(): Promise<RefreshResponse> {
+  if (!refreshPromise) {
+    refreshPromise = apiJson<RefreshResponse>("/api/auth/refresh", { method: "POST" }, { skipRefresh: true })
+      .then((payload) => {
+        setAccessToken(payload.accessToken)
+        return payload
+      })
+      .finally(() => {
+        refreshPromise = null
+      })
+  }
+  return refreshPromise
+}
+
+async function apiJson<T>(
+  url: string,
+  init: RequestInit = {},
+  options: { skipRefresh?: boolean } = {},
+): Promise<T> {
+  return apiJsonRequest<T>(url, init, options)
+}
+
+async function apiJsonRequest<T>(
+  url: string,
+  init: RequestInit,
+  options: { skipRefresh?: boolean },
+): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json")
+  }
+  if (accessToken && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${accessToken}`)
   }
 
   const response = await fetch(url, {
@@ -1760,7 +1808,20 @@ async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as ApiError
-    throw new Error(payload.message ?? `请求失败（${response.status}）`)
+    const error = new ApiRequestError(
+      response.status,
+      payload.message ?? `请求失败（${response.status}）`,
+      payload.code,
+    )
+    if (!options.skipRefresh && response.status === 401 && payload.code === "AUTH_REQUIRED") {
+      try {
+        await refreshAccessToken()
+        return apiJsonRequest<T>(url, init, { skipRefresh: true })
+      } catch {
+        setAccessToken(null)
+      }
+    }
+    throw error
   }
 
   return (await response.json()) as T
@@ -1768,16 +1829,6 @@ async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
 
 function isAdminPath(pathname: string): boolean {
   return normalizePath(pathname) === "_mlist/admin"
-}
-
-function fileUrl(path: string): string {
-  const normalized = normalizePath(path)
-  if (!normalized) return "/d"
-  const encodedPath = normalized
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/")
-  return `/d/${encodedPath}`
 }
 
 function normalizePath(path: string): string {
@@ -1842,6 +1893,13 @@ function toAbsoluteUrl(url: string): string {
   return new URL(url, window.location.origin).toString()
 }
 
+async function createSignedFileLink(path: string): Promise<SignedFileLinkResponse> {
+  return apiJson<SignedFileLinkResponse>("/api/file-link", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  })
+}
+
 function formatBytes(bytes: number, fractionDigits?: number): string {
   if (bytes < 1024) {
     return fractionDigits == null ? `${bytes} B` : `${bytes.toFixed(fractionDigits)} B`
@@ -1863,6 +1921,50 @@ function formatRange(start: number | null | undefined, end: number | null | unde
 
 function formatDate(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleString()
+}
+
+function FilePreview({ entry }: { entry: ListEntry }) {
+  const [previewUrl, setPreviewUrl] = useState("")
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    setError("")
+    setPreviewUrl("")
+    createSignedFileLink(entry.path)
+      .then((payload) => {
+        if (active) setPreviewUrl(payload.url)
+      })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : "加载预览失败")
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [entry.path])
+
+  if (loading) {
+    return (
+      <div className="text-muted-foreground flex min-h-[45vh] items-center justify-center text-sm">
+        正在加载预览...
+      </div>
+    )
+  }
+
+  if (error || !previewUrl) {
+    return (
+      <div className="text-muted-foreground flex min-h-[45vh] items-center justify-center text-sm">
+        {error || "加载预览失败"}
+      </div>
+    )
+  }
+
+  return renderPreview(entry, previewUrl)
 }
 
 function renderPreview(entry: ListEntry, previewUrl: string) {

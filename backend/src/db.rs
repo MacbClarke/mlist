@@ -274,6 +274,29 @@ impl AuthDb {
             .await?;
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS access_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_active_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS access_tokens_user_id_idx ON access_tokens(user_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS access_tokens_expires_at_idx ON access_tokens(expires_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS signed_file_tokens (
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -550,7 +573,7 @@ impl AuthDb {
         row.as_ref().map(user_from_row).transpose()
     }
 
-    pub async fn create_session(
+    pub async fn create_refresh_session(
         &self,
         user_id: i64,
         token: &str,
@@ -574,18 +597,42 @@ impl AuthDb {
         Ok(expires_at)
     }
 
-    pub async fn session_by_token(&self, token: &str) -> ApiResult<Option<AuthSession>> {
+    pub async fn create_access_token(
+        &self,
+        user_id: i64,
+        token: &str,
+        ttl_seconds: u64,
+    ) -> ApiResult<i64> {
         let now = now_unix() as i64;
-        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1")
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(db_error)?;
+        let expires_at = now.saturating_add(ttl_seconds as i64);
+        sqlx::query(
+            r#"
+            INSERT INTO access_tokens (token_hash, user_id, expires_at, created_at, last_active_at)
+            VALUES (?1, ?2, ?3, ?4, ?4)
+            "#,
+        )
+        .bind(hash_token(token))
+        .bind(user_id)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(expires_at)
+    }
 
-        let token_hash = hash_token(token);
+    pub async fn rotate_refresh_session(
+        &self,
+        current_token: &str,
+        next_token: &str,
+        ttl_seconds: u64,
+    ) -> ApiResult<Option<(AuthSession, i64)>> {
+        let now = now_unix() as i64;
+        let current_hash = hash_token(current_token);
         let Some(row) = sqlx::query(
             r#"
             SELECT
+                s.user_id,
                 s.expires_at,
                 u.id, u.username, u.role, u.totp_secret, u.enabled,
                 u.created_at, u.updated_at, u.last_login_at, u.last_seen_at,
@@ -595,6 +642,80 @@ impl AuthDb {
             LEFT JOIN user_resource_usage uru ON uru.user_id = u.id
             WHERE s.token_hash = ?1 AND s.expires_at > ?2
             GROUP BY s.token_hash
+            "#,
+        )
+        .bind(&current_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        else {
+            return Ok(None);
+        };
+
+        let user = user_from_row(&row)?;
+        if !user.enabled {
+            self.remove_sessions_for_user(user.id).await?;
+            return Ok(None);
+        }
+
+        let next_expires_at = now.saturating_add(ttl_seconds as i64);
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let deleted = sqlx::query("DELETE FROM sessions WHERE token_hash = ?1")
+            .bind(&current_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?
+            .rows_affected();
+        if deleted == 0 {
+            tx.commit().await.map_err(db_error)?;
+            return Ok(None);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_active_at)
+            VALUES (?1, ?2, ?3, ?4, ?4)
+            "#,
+        )
+        .bind(hash_token(next_token))
+        .bind(user.id)
+        .bind(next_expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+
+        Ok(Some((
+            AuthSession {
+                user,
+                expires_at: row.get("expires_at"),
+            },
+            next_expires_at,
+        )))
+    }
+
+    pub async fn access_session_by_token(&self, token: &str) -> ApiResult<Option<AuthSession>> {
+        let now = now_unix() as i64;
+        sqlx::query("DELETE FROM access_tokens WHERE expires_at <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+
+        let token_hash = hash_token(token);
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT
+                a.expires_at,
+                u.id, u.username, u.role, u.totp_secret, u.enabled,
+                u.created_at, u.updated_at, u.last_login_at, u.last_seen_at,
+                COALESCE(SUM(uru.total_bytes_served), 0) AS total_bytes_served
+            FROM access_tokens a
+            JOIN users u ON u.id = a.user_id
+            LEFT JOIN user_resource_usage uru ON uru.user_id = u.id
+            WHERE a.token_hash = ?1 AND a.expires_at > ?2
+            GROUP BY a.token_hash
             "#,
         )
         .bind(&token_hash)
@@ -608,11 +729,11 @@ impl AuthDb {
 
         let user = user_from_row(&row)?;
         if !user.enabled {
-            self.remove_session_by_hash(&token_hash).await?;
+            self.remove_access_token_by_hash(&token_hash).await?;
             return Ok(None);
         }
 
-        sqlx::query("UPDATE sessions SET last_active_at = ?1 WHERE token_hash = ?2")
+        sqlx::query("UPDATE access_tokens SET last_active_at = ?1 WHERE token_hash = ?2")
             .bind(now)
             .bind(&token_hash)
             .execute(&self.pool)
@@ -711,16 +832,46 @@ impl AuthDb {
         }))
     }
 
-    pub async fn remove_session(&self, token: &str) -> ApiResult<()> {
-        self.remove_session_by_hash(&hash_token(token)).await
+    pub async fn remove_refresh_session(&self, token: &str) -> ApiResult<()> {
+        self.remove_refresh_session_by_hash(&hash_token(token))
+            .await
     }
 
-    async fn remove_session_by_hash(&self, token_hash: &str) -> ApiResult<()> {
+    pub async fn remove_access_token(&self, token: &str) -> ApiResult<()> {
+        self.remove_access_token_by_hash(&hash_token(token)).await
+    }
+
+    async fn remove_refresh_session_by_hash(&self, token_hash: &str) -> ApiResult<()> {
         sqlx::query("DELETE FROM sessions WHERE token_hash = ?1")
             .bind(token_hash)
             .execute(&self.pool)
             .await
             .map_err(db_error)?;
+        Ok(())
+    }
+
+    async fn remove_access_token_by_hash(&self, token_hash: &str) -> ApiResult<()> {
+        sqlx::query("DELETE FROM access_tokens WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    async fn remove_sessions_for_user(&self, user_id: i64) -> ApiResult<()> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        sqlx::query("DELETE FROM access_tokens WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(())
     }
 
@@ -1193,6 +1344,11 @@ impl AuthDb {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_error)?;
+            sqlx::query("DELETE FROM access_tokens WHERE user_id = ?1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
             sqlx::query("DELETE FROM signed_file_tokens WHERE user_id = ?1")
                 .bind(user_id)
                 .execute(&mut *tx)
@@ -1226,6 +1382,7 @@ impl AuthDb {
 
         for table in [
             "sessions",
+            "access_tokens",
             "signed_file_tokens",
             "resource_access_events",
             "user_resource_usage",
@@ -1260,6 +1417,11 @@ impl AuthDb {
             .await
             .map_err(db_error)?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        sqlx::query("DELETE FROM access_tokens WHERE user_id = ?1")
             .bind(user_id)
             .execute(&mut *tx)
             .await
@@ -1792,6 +1954,94 @@ mod tests {
         db.set_user_enabled(user.id, false).await.unwrap();
         assert!(
             db.signed_file_session("raw-token", "movies/a.mp4")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn remove_access_token_revokes_bearer_session() {
+        let path = test_db_path("remove-access-token");
+        let db = AuthDb::connect(&path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+
+        db.create_access_token(user.id, "access-one", 60)
+            .await
+            .unwrap();
+        assert!(
+            db.access_session_by_token("access-one")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        db.remove_access_token("access-one").await.unwrap();
+        assert!(
+            db.access_session_by_token("access-one")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn refresh_rotation_invalidates_previous_refresh_and_access_tokens() {
+        let path = test_db_path("refresh-rotation");
+        let db = AuthDb::connect(&path).await.unwrap();
+        let user = db
+            .create_user("alice", UserRole::User, "SECRET")
+            .await
+            .unwrap();
+
+        db.create_refresh_session(user.id, "refresh-one", 60)
+            .await
+            .unwrap();
+        db.create_access_token(user.id, "access-one", 60)
+            .await
+            .unwrap();
+
+        let (session, _) = db
+            .rotate_refresh_session("refresh-one", "refresh-two", 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.user.id, user.id);
+        assert!(
+            db.rotate_refresh_session("refresh-one", "refresh-three", 60)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.rotate_refresh_session("refresh-two", "refresh-three", 60)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.access_session_by_token("access-one")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        db.set_user_enabled(user.id, false).await.unwrap();
+        assert!(
+            db.access_session_by_token("access-one")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.rotate_refresh_session("refresh-three", "refresh-four", 60)
                 .await
                 .unwrap()
                 .is_none()

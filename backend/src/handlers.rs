@@ -32,7 +32,7 @@ use crate::errors::{ApiError, ApiResult};
 use crate::path_guard::{
     ensure_not_marker_path, is_private_marker_name, normalize_relative_path, resolve_existing_path,
 };
-use crate::session::{LoginRateLimiter, SESSION_COOKIE_NAME, now_unix, unix_to_rfc3339};
+use crate::session::{LoginRateLimiter, REFRESH_COOKIE_NAME, now_unix, unix_to_rfc3339};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -98,7 +98,9 @@ pub struct LoginRequest {
 #[serde(rename_all = "camelCase")]
 pub struct LoginResponse {
     pub ok: bool,
-    pub expires_at: String,
+    pub access_token: String,
+    pub access_expires_at: String,
+    pub refresh_expires_at: String,
     pub user: UserView,
 }
 
@@ -107,8 +109,18 @@ pub struct LoginResponse {
 pub struct MeResponse {
     pub authenticated: bool,
     pub user: Option<UserView>,
-    pub expires_at: Option<String>,
+    pub access_expires_at: Option<String>,
     pub needs_bootstrap: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshResponse {
+    pub ok: bool,
+    pub access_token: String,
+    pub access_expires_at: String,
+    pub refresh_expires_at: String,
+    pub user: UserView,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,10 +222,10 @@ impl ByteRange {
 
 pub async fn list_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Query(query): Query<PathQuery>,
 ) -> ApiResult<Json<ListResponse>> {
-    let session = require_session(&state, &jar).await?;
+    let session = require_session(&state, &headers).await?;
     let relative_path = normalize_relative_path(query.path.as_deref())?;
     ensure_not_marker_path(&relative_path)?;
 
@@ -365,7 +377,6 @@ pub async fn list_handler(
 
 pub async fn direct_file_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
     AxumPath(raw_path): AxumPath<String>,
     Query(query): Query<DirectFileQuery>,
     headers: HeaderMap,
@@ -373,7 +384,6 @@ pub async fn direct_file_handler(
     let relative_path = normalize_relative_path(Some(&raw_path))?;
     serve_file_response(
         &state,
-        &jar,
         &headers,
         relative_path,
         "/d",
@@ -384,13 +394,12 @@ pub async fn direct_file_handler(
 
 async fn serve_file_response(
     state: &AppState,
-    jar: &CookieJar,
     headers: &HeaderMap,
     relative_path: String,
     route: &'static str,
     signed_token: Option<&str>,
 ) -> ApiResult<Response> {
-    let session = file_session_for_request(state, jar, &relative_path, signed_token).await?;
+    let session = file_session_for_request(state, &relative_path, signed_token).await?;
     let accessible = ensure_file_accessible(state, &session, &relative_path).await?;
     let resolved = accessible.resolved;
     let metadata = accessible.metadata;
@@ -817,23 +826,30 @@ pub async fn login_handler(
     let user = user.ok_or_else(|| ApiError::unauthorized("Invalid username or code."))?;
     state.login_limiter.record_success(&limiter_key).await;
 
-    let session_token = uuid::Uuid::new_v4().simple().to_string();
-    let expires_at = state
+    let refresh_token = uuid::Uuid::new_v4().simple().to_string();
+    let refresh_expires_at = state
         .db
-        .create_session(user.id, &session_token, state.config.session_ttl_seconds)
+        .create_refresh_session(user.id, &refresh_token, state.config.refresh_ttl_seconds)
+        .await?;
+    let access_token = uuid::Uuid::new_v4().simple().to_string();
+    let access_expires_at = state
+        .db
+        .create_access_token(user.id, &access_token, state.config.access_ttl_seconds)
         .await?;
     state.db.record_login(user.id).await?;
 
     info!(ip = client_ip, user = user.username, "login succeeded");
 
-    let cookie = build_session_cookie(&session_token, state.config.session_ttl_seconds);
+    let cookie = build_refresh_cookie(&refresh_token, state.config.refresh_ttl_seconds);
     let updated_jar = jar.add(cookie);
 
     Ok((
         updated_jar,
         Json(LoginResponse {
             ok: true,
-            expires_at: unix_to_rfc3339(expires_at as u64),
+            access_token,
+            access_expires_at: unix_to_rfc3339(access_expires_at as u64),
+            refresh_expires_at: unix_to_rfc3339(refresh_expires_at as u64),
             user: user.view(),
         }),
     ))
@@ -875,23 +891,77 @@ pub async fn bootstrap_finish_handler(
     }
 
     let user = state.db.bootstrap_admin(username, &payload.secret).await?;
-    let session_token = uuid::Uuid::new_v4().simple().to_string();
-    let expires_at = state
+    let refresh_token = uuid::Uuid::new_v4().simple().to_string();
+    let refresh_expires_at = state
         .db
-        .create_session(user.id, &session_token, state.config.session_ttl_seconds)
+        .create_refresh_session(user.id, &refresh_token, state.config.refresh_ttl_seconds)
+        .await?;
+    let access_token = uuid::Uuid::new_v4().simple().to_string();
+    let access_expires_at = state
+        .db
+        .create_access_token(user.id, &access_token, state.config.access_ttl_seconds)
         .await?;
     state.db.record_login(user.id).await?;
     info!(user = user.username, "bootstrap admin created");
 
-    let cookie = build_session_cookie(&session_token, state.config.session_ttl_seconds);
+    let cookie = build_refresh_cookie(&refresh_token, state.config.refresh_ttl_seconds);
     let updated_jar = jar.add(cookie);
 
     Ok((
         updated_jar,
         Json(LoginResponse {
             ok: true,
-            expires_at: unix_to_rfc3339(expires_at as u64),
+            access_token,
+            access_expires_at: unix_to_rfc3339(access_expires_at as u64),
+            refresh_expires_at: unix_to_rfc3339(refresh_expires_at as u64),
             user: user.view(),
+        }),
+    ))
+}
+
+pub async fn refresh_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<(CookieJar, Json<RefreshResponse>)> {
+    let Some(cookie) = jar.get(REFRESH_COOKIE_NAME) else {
+        return Err(ApiError::auth_required());
+    };
+
+    let next_refresh_token = uuid::Uuid::new_v4().simple().to_string();
+    let Some((session, refresh_expires_at)) = state
+        .db
+        .rotate_refresh_session(
+            cookie.value(),
+            &next_refresh_token,
+            state.config.refresh_ttl_seconds,
+        )
+        .await?
+    else {
+        return Err(ApiError::auth_required());
+    };
+
+    let access_token = uuid::Uuid::new_v4().simple().to_string();
+    let access_expires_at = state
+        .db
+        .create_access_token(
+            session.user.id,
+            &access_token,
+            state.config.access_ttl_seconds,
+        )
+        .await?;
+    let updated_jar = jar.add(build_refresh_cookie(
+        &next_refresh_token,
+        state.config.refresh_ttl_seconds,
+    ));
+
+    Ok((
+        updated_jar,
+        Json(RefreshResponse {
+            ok: true,
+            access_token,
+            access_expires_at: unix_to_rfc3339(access_expires_at as u64),
+            refresh_expires_at: unix_to_rfc3339(refresh_expires_at as u64),
+            user: session.user.view(),
         }),
     ))
 }
@@ -899,13 +969,17 @@ pub async fn bootstrap_finish_handler(
 pub async fn logout_handler(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
 ) -> ApiResult<(CookieJar, Json<GenericOkResponse>)> {
-    if let Some(cookie) = jar.get(SESSION_COOKIE_NAME) {
-        state.db.remove_session(cookie.value()).await?;
+    if let Some(cookie) = jar.get(REFRESH_COOKIE_NAME) {
+        state.db.remove_refresh_session(cookie.value()).await?;
+    }
+    if let Some(token) = bearer_token(&headers) {
+        state.db.remove_access_token(token).await?;
     }
 
-    let removal = Cookie::build((SESSION_COOKIE_NAME, ""))
-        .path("/")
+    let removal = Cookie::build((REFRESH_COOKIE_NAME, ""))
+        .path("/api/auth")
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(time::Duration::seconds(0))
@@ -916,14 +990,14 @@ pub async fn logout_handler(
 
 pub async fn me_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> ApiResult<Json<MeResponse>> {
     let needs_bootstrap = state.db.needs_bootstrap().await?;
-    let Some(session) = current_session(&state, &jar).await? else {
+    let Some(session) = current_session(&state, &headers).await? else {
         return Ok(Json(MeResponse {
             authenticated: false,
             user: None,
-            expires_at: None,
+            access_expires_at: None,
             needs_bootstrap,
         }));
     };
@@ -931,16 +1005,16 @@ pub async fn me_handler(
     Ok(Json(MeResponse {
         authenticated: true,
         user: Some(session.user.view()),
-        expires_at: Some(unix_to_rfc3339(session.expires_at as u64)),
+        access_expires_at: Some(unix_to_rfc3339(session.expires_at as u64)),
         needs_bootstrap,
     }))
 }
 
 pub async fn admin_users_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> ApiResult<Json<UsersResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     Ok(Json(UsersResponse {
         users: state.db.list_users().await?,
     }))
@@ -948,10 +1022,10 @@ pub async fn admin_users_handler(
 
 pub async fn admin_audit_events_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditEventsResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let offset = query.offset.unwrap_or(0).max(0);
     let mut events = state
@@ -967,10 +1041,10 @@ pub async fn admin_audit_events_handler(
 
 pub async fn admin_audit_resources_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditResourcesResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let offset = query.offset.unwrap_or(0).max(0);
     let mut resources = state
@@ -989,10 +1063,10 @@ pub async fn admin_audit_resources_handler(
 
 pub async fn admin_create_user_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Json(payload): Json<CreateUserRequest>,
 ) -> ApiResult<Json<TotpBindingResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let username = payload.username.trim();
     validate_login_name(username)?;
     let secret = generate_totp_secret();
@@ -1005,38 +1079,38 @@ pub async fn admin_create_user_handler(
 
 pub async fn admin_disable_user_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(user_id): AxumPath<i64>,
 ) -> ApiResult<Json<UserView>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     Ok(Json(state.db.set_user_enabled(user_id, false).await?))
 }
 
 pub async fn admin_enable_user_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(user_id): AxumPath<i64>,
 ) -> ApiResult<Json<UserView>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     Ok(Json(state.db.set_user_enabled(user_id, true).await?))
 }
 
 pub async fn admin_delete_user_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(user_id): AxumPath<i64>,
 ) -> ApiResult<Json<GenericOkResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     state.db.delete_user(user_id).await?;
     Ok(Json(GenericOkResponse { ok: true }))
 }
 
 pub async fn admin_reset_totp_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(user_id): AxumPath<i64>,
 ) -> ApiResult<Json<TotpBindingResponse>> {
-    require_admin(&state, &jar).await?;
+    require_admin(&state, &headers).await?;
     let secret = generate_totp_secret();
     let user = state.db.reset_totp(user_id, &secret).await?;
     Ok(Json(binding_response(user.view(), &secret)?))
@@ -1044,10 +1118,10 @@ pub async fn admin_reset_totp_handler(
 
 pub async fn create_file_link_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Json(payload): Json<SignedFileLinkRequest>,
 ) -> ApiResult<Json<SignedFileLinkResponse>> {
-    let session = require_session(&state, &jar).await?;
+    let session = require_session(&state, &headers).await?;
     let path = normalize_relative_path(Some(&payload.path))?;
     ensure_file_accessible(&state, &session, &path).await?;
 
@@ -1070,9 +1144,9 @@ pub async fn create_file_link_handler(
 
 pub async fn file_states_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
 ) -> ApiResult<Json<FileStatesResponse>> {
-    let session = require_session(&state, &jar).await?;
+    let session = require_session(&state, &headers).await?;
     Ok(Json(FileStatesResponse {
         files: state.db.list_highlighted_files(session.user.id).await?,
     }))
@@ -1080,10 +1154,10 @@ pub async fn file_states_handler(
 
 pub async fn set_file_state_handler(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Json(payload): Json<FileStateRequest>,
 ) -> ApiResult<Json<UserFileStateView>> {
-    let session = require_session(&state, &jar).await?;
+    let session = require_session(&state, &headers).await?;
     let path = normalize_relative_path(Some(&payload.path))?;
     ensure_file_accessible(&state, &session, &path).await?;
 
@@ -1123,33 +1197,35 @@ fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
         .or_else(|| raw.parse::<SocketAddr>().ok().map(|value| value.ip()))
 }
 
-fn build_session_cookie(session_id: &str, ttl_seconds: u64) -> Cookie<'static> {
-    Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
-        .path("/")
+fn build_refresh_cookie(refresh_token: &str, ttl_seconds: u64) -> Cookie<'static> {
+    Cookie::build((REFRESH_COOKIE_NAME, refresh_token.to_string()))
+        .path("/api/auth")
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(time::Duration::seconds(ttl_seconds as i64))
         .build()
 }
 
-async fn current_session(state: &AppState, jar: &CookieJar) -> ApiResult<Option<AuthSession>> {
-    let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+async fn current_session(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<AuthSession>> {
+    let Some(token) = bearer_token(headers) else {
         return Ok(None);
     };
-    let sid = cookie.value().to_string();
-    state.db.session_by_token(&sid).await
+    state.db.access_session_by_token(token).await
 }
 
 async fn file_session_for_request(
     state: &AppState,
-    jar: &CookieJar,
     relative_path: &str,
     signed_token: Option<&str>,
 ) -> ApiResult<AuthSession> {
-    if let Some(session) = current_session(state, jar).await? {
-        return Ok(session);
-    }
-
     let Some(token) = signed_token
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1164,14 +1240,14 @@ async fn file_session_for_request(
         .ok_or_else(ApiError::auth_required)
 }
 
-async fn require_session(state: &AppState, jar: &CookieJar) -> ApiResult<AuthSession> {
-    current_session(state, jar)
+async fn require_session(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthSession> {
+    current_session(state, headers)
         .await?
         .ok_or_else(ApiError::auth_required)
 }
 
-async fn require_admin(state: &AppState, jar: &CookieJar) -> ApiResult<AuthSession> {
-    let session = require_session(state, jar).await?;
+async fn require_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthSession> {
+    let session = require_session(state, headers).await?;
     if !session.user.role.is_admin() {
         return Err(ApiError::forbidden("Administrator privileges required."));
     }

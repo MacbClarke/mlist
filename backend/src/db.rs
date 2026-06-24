@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,13 @@ pub struct UserFileStateView {
     pub path: String,
     pub highlighted: bool,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFavoriteView {
+    pub path: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +421,18 @@ impl AuthDb {
                 highlighted INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, path)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_favorites (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
                 PRIMARY KEY (user_id, path)
             )
             "#,
@@ -1309,6 +1329,98 @@ impl AuthDb {
             highlighted,
             updated_at: now,
         })
+    }
+
+    pub async fn list_favorite_paths(&self, user_id: i64) -> ApiResult<HashSet<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT path
+            FROM user_favorites
+            WHERE user_id = ?1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        Ok(rows.into_iter().map(|row| row.get::<String, _>("path")).collect())
+    }
+
+    pub async fn list_favorites(&self, user_id: i64) -> ApiResult<Vec<UserFavoriteView>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT path, created_at
+            FROM user_favorites
+            WHERE user_id = ?1
+            ORDER BY created_at DESC, path COLLATE NOCASE
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| UserFavoriteView {
+                path: row.get("path"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    pub async fn set_file_favorite(
+        &self,
+        user_id: i64,
+        path: &str,
+        favorite: bool,
+    ) -> ApiResult<bool> {
+        let now = now_unix() as i64;
+        if favorite {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO user_favorites (user_id, path, created_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(user_id, path) DO NOTHING
+                "#,
+            )
+            .bind(user_id)
+            .bind(path)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+            Ok(result.rows_affected() > 0)
+        } else {
+            let result = sqlx::query(
+                r#"
+                DELETE FROM user_favorites
+                WHERE user_id = ?1 AND path = ?2
+                "#,
+            )
+            .bind(user_id)
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+            Ok(result.rows_affected() > 0)
+        }
+    }
+
+    pub async fn delete_favorite(&self, user_id: i64, path: &str) -> ApiResult<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM user_favorites
+            WHERE user_id = ?1 AND path = ?2
+            "#,
+        )
+        .bind(user_id)
+        .bind(path)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(())
     }
 
     pub async fn set_user_enabled(&self, user_id: i64, enabled: bool) -> ApiResult<UserView> {

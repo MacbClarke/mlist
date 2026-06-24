@@ -26,7 +26,8 @@ use crate::auth::{find_private_anchor, has_private_hide_marker};
 use crate::config::AppConfig;
 use crate::db::{
     AuthDb, AuthSession, RecordResourceAccess, ResourceAccessEventView, ResourceKind,
-    ResourceTransferState, ResourceUsageView, UserFileStateView, UserRole, UserRoleInput, UserView,
+    ResourceTransferState, ResourceUsageView, UserFavoriteView, UserFileStateView, UserRole,
+    UserRoleInput, UserView,
 };
 use crate::errors::{ApiError, ApiResult};
 use crate::path_guard::{
@@ -42,8 +43,15 @@ pub struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PathQuery {
     pub path: Option<String>,
+    pub sort: Option<String>,
+    pub order: Option<String>,
+    pub offset: Option<i64>,
+    pub limit: Option<i64>,
+    pub favorites_only: Option<bool>,
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,9 +74,11 @@ pub struct ListResponse {
     pub entries: Vec<ListEntry>,
     pub requires_auth: bool,
     pub authorized: bool,
+    pub total: usize,
+    pub has_more: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListEntry {
     pub name: String,
@@ -79,9 +89,10 @@ pub struct ListEntry {
     pub mime: Option<String>,
     pub requires_auth: bool,
     pub authorized: bool,
+    pub favorite: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryKind {
     Dir,
@@ -203,6 +214,18 @@ pub struct FileStatesResponse {
     pub files: Vec<UserFileStateView>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FavoriteRequest {
+    pub path: String,
+    pub favorite: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoritesResponse {
+    pub paths: Vec<UserFavoriteView>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GenericOkResponse {
     pub ok: bool,
@@ -252,6 +275,11 @@ pub async fn list_handler(
         }
     }
 
+    let favorites_only = query.favorites_only.unwrap_or(false);
+    let search = query.search.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let search_lower = search.map(|value| value.to_lowercase());
+    let fav_set = state.db.list_favorite_paths(session.user.id).await?;
+
     let mut entries = Vec::new();
     let mut read_dir = fs::read_dir(&resolved)
         .await
@@ -265,6 +293,11 @@ pub async fn list_handler(
         let name = entry.file_name().to_string_lossy().to_string();
         if is_private_marker_name(&name) {
             continue;
+        }
+        if let Some(search) = &search_lower {
+            if !name.to_lowercase().contains(search) {
+                continue;
+            }
         }
 
         let file_type = entry
@@ -285,6 +318,19 @@ pub async fn list_handler(
         } else {
             format!("{relative_path}/{name}")
         };
+
+        if favorites_only {
+            let kept = if file_type.is_dir() {
+                let prefix = format!("{entry_path}/");
+                fav_set.contains(&entry_path)
+                    || fav_set.iter().any(|fav| fav.starts_with(&prefix))
+            } else {
+                fav_set.contains(&entry_path)
+            };
+            if !kept {
+                continue;
+            }
+        }
 
         let resolved_entry = resolve_existing_path(root, &entry_path).await?;
         let entry_meta = fs::metadata(&resolved_entry)
@@ -321,7 +367,7 @@ pub async fn list_handler(
 
         entries.push(ListEntry {
             name,
-            path: entry_path,
+            path: entry_path.clone(),
             kind: if file_type.is_dir() {
                 EntryKind::Dir
             } else {
@@ -336,21 +382,48 @@ pub async fn list_handler(
             mime,
             requires_auth,
             authorized,
+            favorite: fav_set.contains(&entry_path),
         });
     }
 
+    let sort_field = query.sort.as_deref().unwrap_or("name");
+    let order_desc = matches!(query.order.as_deref(), Some("desc"));
+    let explicit_sort = query.sort.is_some() || query.order.is_some();
+
     entries.sort_by(|a, b| {
-        let type_order = match (&a.kind, &b.kind) {
-            (EntryKind::Dir, EntryKind::File) => std::cmp::Ordering::Less,
-            (EntryKind::File, EntryKind::Dir) => std::cmp::Ordering::Greater,
-            _ => std::cmp::Ordering::Equal,
-        };
-        if type_order != std::cmp::Ordering::Equal {
-            return type_order;
+        if !explicit_sort {
+            let type_order = match (&a.kind, &b.kind) {
+                (EntryKind::Dir, EntryKind::File) => std::cmp::Ordering::Less,
+                (EntryKind::File, EntryKind::Dir) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            };
+            if type_order != std::cmp::Ordering::Equal {
+                return type_order;
+            }
+            return a.name.to_lowercase().cmp(&b.name.to_lowercase());
         }
 
-        a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        let ordering = match sort_field {
+            "size" => {
+                let (av, bv) = (a.size.unwrap_or(0), b.size.unwrap_or(0));
+                av.cmp(&bv).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+            "mtime" => {
+                let (av, bv) = (a.mtime.unwrap_or(0), b.mtime.unwrap_or(0));
+                av.cmp(&bv).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        };
+        if order_desc { ordering.reverse() } else { ordering }
     });
+
+    let total = entries.len();
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let offset = query.offset.unwrap_or(0).max(0) as usize;
+    let has_more = offset.saturating_add(limit) < total;
+    let offset = offset.min(total);
+    let end = offset.saturating_add(limit).min(total);
+    let entries = entries[offset..end].to_vec();
 
     state
         .db
@@ -372,6 +445,8 @@ pub async fn list_handler(
         entries,
         requires_auth: anchor.is_some(),
         authorized: true,
+        total,
+        has_more,
     }))
 }
 
@@ -1167,6 +1242,125 @@ pub async fn set_file_state_handler(
             .set_file_highlighted(session.user.id, &path, payload.highlighted)
             .await?,
     ))
+}
+
+pub async fn favorites_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<FavoritesResponse>> {
+    let session = require_session(&state, &headers).await?;
+    let favorites = state.db.list_favorites(session.user.id).await?;
+
+    let mut valid = Vec::with_capacity(favorites.len());
+    for fav in favorites {
+        if favorite_path_valid(&state, &session, &fav.path).await {
+            valid.push(fav);
+        } else {
+            state.db.delete_favorite(session.user.id, &fav.path).await?;
+        }
+    }
+
+    Ok(Json(FavoritesResponse { paths: valid }))
+}
+
+pub async fn set_favorite_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<FavoriteRequest>,
+) -> ApiResult<Json<UserFavoriteView>> {
+    let session = require_session(&state, &headers).await?;
+    let path = normalize_relative_path(Some(&payload.path))?;
+    ensure_path_favorite_accessible(&state, &session, &path).await?;
+
+    let now = now_unix() as i64;
+    state
+        .db
+        .set_file_favorite(session.user.id, &path, payload.favorite)
+        .await?;
+
+    Ok(Json(UserFavoriteView { path, created_at: now }))
+}
+
+async fn ensure_path_favorite_accessible(
+    state: &AppState,
+    session: &AuthSession,
+    relative_path: &str,
+) -> ApiResult<()> {
+    ensure_not_marker_path(relative_path)?;
+    if relative_path.is_empty() {
+        return Err(ApiError::bad_request("Path must reference a file or directory."));
+    }
+
+    let root = &state.config.root_dir;
+    let resolved = resolve_existing_path(root, relative_path).await?;
+    let metadata = fs::metadata(&resolved)
+        .await
+        .map_err(|err| ApiError::from_io(err, "path"))?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(ApiError::bad_request("Path is neither a file nor a directory."));
+    }
+
+    if file_name_is_marker(&resolved) {
+        return Err(ApiError::not_found("Path not found."));
+    }
+
+    if metadata.is_dir()
+        && has_private_hide_marker(&resolved).await?
+        && !session.user.role.is_admin()
+    {
+        return Err(ApiError::not_found("Path not found."));
+    }
+
+    if let Some(anchor) = find_private_anchor(root, &resolved, metadata.is_dir()).await? {
+        if !session.user.role.is_admin() {
+            info!(
+                user = session.user.username,
+                scope = anchor.scope_rel,
+                marker = anchor.marker_file,
+                "non-admin favorite path access denied"
+            );
+            return Err(ApiError::not_found("Path not found."));
+        }
+    }
+
+    Ok(())
+}
+
+async fn favorite_path_valid(
+    state: &AppState,
+    session: &AuthSession,
+    relative_path: &str,
+) -> bool {
+    if ensure_not_marker_path(relative_path).is_err() || relative_path.is_empty() {
+        return false;
+    }
+    let root = &state.config.root_dir;
+    let resolved = match resolve_existing_path(root, relative_path).await {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let metadata = match fs::metadata(&resolved).await {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !metadata.is_dir() && !metadata.is_file() {
+        return false;
+    }
+    if file_name_is_marker(&resolved) {
+        return false;
+    }
+    if metadata.is_dir() {
+        match has_private_hide_marker(&resolved).await {
+            Ok(true) if !session.user.role.is_admin() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    match find_private_anchor(root, &resolved, metadata.is_dir()).await {
+        Ok(Some(_)) => session.user.role.is_admin(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 fn client_ip_for_request(headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {

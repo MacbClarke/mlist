@@ -19,9 +19,9 @@ use handlers::{
     AppState, admin_audit_events_handler, admin_audit_resources_handler, admin_create_user_handler,
     admin_delete_user_handler, admin_disable_user_handler, admin_enable_user_handler,
     admin_reset_totp_handler, admin_users_handler, bootstrap_finish_handler,
-    bootstrap_start_handler, create_file_link_handler, direct_file_handler, file_states_handler,
-    list_handler, login_handler, logout_handler, me_handler, refresh_handler,
-    set_file_state_handler,
+    bootstrap_start_handler, create_file_link_handler, direct_file_handler, favorites_handler,
+    file_states_handler, list_handler, login_handler, logout_handler, me_handler, refresh_handler,
+    set_favorite_handler, set_file_state_handler,
 };
 use serde_json::json;
 use session::LoginRateLimiter;
@@ -80,6 +80,8 @@ async fn main() {
         .route("/api/file-link", post(create_file_link_handler))
         .route("/api/file-states", get(file_states_handler))
         .route("/api/file-states", post(set_file_state_handler))
+        .route("/api/favorites", get(favorites_handler))
+        .route("/api/favorites", post(set_favorite_handler))
         .route("/api/admin/users", get(admin_users_handler))
         .route("/api/admin/users", post(admin_create_user_handler))
         .route("/api/admin/users/{id}", delete(admin_delete_user_handler))

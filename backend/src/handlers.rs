@@ -320,14 +320,7 @@ pub async fn list_handler(
         };
 
         if favorites_only {
-            let kept = if file_type.is_dir() {
-                let prefix = format!("{entry_path}/");
-                fav_set.contains(&entry_path)
-                    || fav_set.iter().any(|fav| fav.starts_with(&prefix))
-            } else {
-                fav_set.contains(&entry_path)
-            };
-            if !kept {
+            if !visible_in_favorites_view(&entry_path, file_type.is_dir(), &fav_set) {
                 continue;
             }
         }
@@ -448,6 +441,33 @@ pub async fn list_handler(
         total,
         has_more,
     }))
+}
+
+fn visible_in_favorites_view(
+    entry_path: &str,
+    is_dir: bool,
+    fav_set: &std::collections::HashSet<String>,
+) -> bool {
+    if fav_set.contains(entry_path) {
+        return true;
+    }
+
+    if fav_set
+        .iter()
+        .any(|fav| path_is_descendant_of(entry_path, fav))
+    {
+        return true;
+    }
+
+    is_dir
+        && fav_set
+            .iter()
+            .any(|fav| path_is_descendant_of(fav, entry_path))
+}
+
+fn path_is_descendant_of(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 pub async fn direct_file_handler(
@@ -1749,6 +1769,7 @@ fn parse_range_header(raw_header: &str, file_size: u64) -> ApiResult<ByteRange> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io;
     use std::net::IpAddr;
     use std::path::{Path, PathBuf};
@@ -1765,7 +1786,7 @@ mod tests {
     use super::{
         CountingFileStream, FileAccessRecorder, content_disposition_inline, format_http_date,
         if_none_match_matches, if_range_matches, make_etag, parse_range_header,
-        parse_x_forwarded_for, signed_direct_file_url,
+        parse_x_forwarded_for, signed_direct_file_url, visible_in_favorites_view,
     };
 
     fn test_path(name: &str, extension: &str) -> PathBuf {
@@ -1786,6 +1807,41 @@ mod tests {
         ) -> Poll<io::Result<()>> {
             Poll::Ready(Err(io::Error::other("read failed")))
         }
+    }
+
+    fn favorite_set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[test]
+    fn favorites_view_keeps_ancestors_of_favorite_file() {
+        let favorites = favorite_set(&["a/b.txt"]);
+
+        assert!(visible_in_favorites_view("a", true, &favorites));
+        assert!(visible_in_favorites_view("a/b.txt", false, &favorites));
+        assert!(!visible_in_favorites_view("a/c.txt", false, &favorites));
+    }
+
+    #[test]
+    fn favorites_view_shows_descendants_of_favorite_directory() {
+        let favorites = favorite_set(&["a"]);
+
+        assert!(visible_in_favorites_view("a", true, &favorites));
+        assert!(visible_in_favorites_view("a/file.txt", false, &favorites));
+        assert!(visible_in_favorites_view("a/subdir", true, &favorites));
+        assert!(visible_in_favorites_view(
+            "a/subdir/deep.txt",
+            false,
+            &favorites
+        ));
+    }
+
+    #[test]
+    fn favorites_view_matches_only_path_boundaries() {
+        let favorites = favorite_set(&["a"]);
+
+        assert!(!visible_in_favorites_view("aa", true, &favorites));
+        assert!(!visible_in_favorites_view("aa/file.txt", false, &favorites));
     }
 
     #[test]

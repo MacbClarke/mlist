@@ -694,13 +694,22 @@ function App() {
     }
 
     function changeSort(field: SortField) {
-        const nextOrder: SortOrder =
-            sorting.sort === field && sorting.order === "asc" ? "desc" : "asc";
-        setSorting({ sort: field, order: nextOrder });
+        // 三态循环：升序 → 降序 → 取消排序
+        let nextField: SortField = field;
+        let nextOrder: SortOrder = "asc";
+        if (sorting.sort === field) {
+            if (sorting.order === "asc") {
+                nextOrder = "desc";
+            } else {
+                nextField = "";
+                nextOrder = "asc";
+            }
+        }
+        setSorting({ sort: nextField, order: nextOrder });
         void loadPath(currentPath, {
             updateUrl: false,
             resetOffset: true,
-            sortOverride: field,
+            sortOverride: nextField,
             orderOverride: nextOrder,
         });
     }
@@ -2369,7 +2378,7 @@ function EntriesTable({
                     />
                 ),
                 cell: ({ row }) => (
-                    <span className="text-muted-foreground text-xs">
+                    <span className="text-muted-foreground text-xs text-right">
                         {row.original.kind === "file"
                             ? formatBytes(row.original.size ?? 0)
                             : "--"}
@@ -2388,7 +2397,7 @@ function EntriesTable({
                     />
                 ),
                 cell: ({ row }) => (
-                    <span className="text-muted-foreground text-xs">
+                    <span className="text-muted-foreground text-xs text-right">
                         {row.original.mtime
                             ? formatDate(row.original.mtime)
                             : "--"}
@@ -2412,14 +2421,21 @@ function EntriesTable({
             <TableHeader>
                 {table.getHeaderGroups().map((headerGroup) => (
                     <TableRow key={headerGroup.id}>
-                        {headerGroup.headers.map((header) => (
-                            <TableHead key={header.id} className="h-9">
-                                {flexRender(
-                                    header.column.columnDef.header,
-                                    header.getContext(),
-                                )}
-                            </TableHead>
-                        ))}
+                        <TableHead
+                            colSpan={columns.length}
+                            className="h-9 p-0"
+                        >
+                            <div className="grid w-full grid-cols-[1fr_auto_auto] items-center gap-3 px-3 sm:grid-cols-[1fr_7rem_9rem]">
+                                {headerGroup.headers.map((header) => (
+                                    <Fragment key={header.id}>
+                                        {flexRender(
+                                            header.column.columnDef.header,
+                                            header.getContext(),
+                                        )}
+                                    </Fragment>
+                                ))}
+                            </div>
+                        </TableHead>
                     </TableRow>
                 ))}
             </TableHeader>

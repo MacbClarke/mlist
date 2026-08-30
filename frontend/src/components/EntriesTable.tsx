@@ -197,7 +197,7 @@ export function EntriesTable({
                                     onOpen(entry);
                                 }
                             }}
-                            className={`group h-auto cursor-pointer select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
+                            className={`group h-auto select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
                                 isSelected
                                     ? "bg-primary/10 hover:bg-primary/15"
                                     : highlighted

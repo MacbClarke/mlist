@@ -974,7 +974,7 @@ function App() {
                         }}
                     >
                         <DownloadIcon className="mr-1.5 size-4" />
-                        打包下载 (ZIP)
+                        打包下载
                     </Button>
                     <Button
                         size="sm"

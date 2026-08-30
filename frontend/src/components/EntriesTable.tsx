@@ -260,7 +260,7 @@ export function EntriesTable({
                                                 }
                                             >
                                                 <DownloadIcon className="mr-2 size-4" />
-                                                打包下载 (ZIP)
+                                                打包下载
                                             </ContextMenuItem>
                                         )}
                                         <ContextMenuItem

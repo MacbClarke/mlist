@@ -83,7 +83,7 @@ export function EntriesTable({
                     />
                 ),
                 cell: ({ row }) => (
-                    <NameCell entry={row.original} onOpen={onOpen} />
+                    <NameCell entry={row.original} />
                 ),
             },
             {
@@ -125,7 +125,7 @@ export function EntriesTable({
                 ),
             },
         ],
-        [sorting, onSort, onOpen],
+        [sorting, onSort],
     );
 
     // eslint-disable-next-line react-hooks/incompatible-library
@@ -190,7 +190,14 @@ export function EntriesTable({
                     return (
                         <TableRow
                             key={entry.path}
-                            className={`group h-auto ${
+                            onClick={() => onOpen(entry)}
+                            tabIndex={0}
+                            onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                    onOpen(entry);
+                                }
+                            }}
+                            className={`group h-auto cursor-pointer select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
                                 isSelected
                                     ? "bg-primary/10 hover:bg-primary/15"
                                     : highlighted
@@ -218,9 +225,7 @@ export function EntriesTable({
                                                     aria-label={`选择 ${entry.name}`}
                                                 />
                                             </div>
-                                            <button
-                                                type="button"
-                                                onClick={() => onOpen(entry)}
+                                            <div
                                                 className="col-span-3 grid grid-cols-[1fr_auto_auto] items-center gap-3 text-left sm:grid-cols-[1fr_7rem_9rem]"
                                             >
                                                 {row
@@ -231,10 +236,10 @@ export function EntriesTable({
                                                                 cell.column
                                                                     .columnDef.cell,
                                                                 cell.getContext(),
-                                                            )}
+                                                             )}
                                                         </Fragment>
                                                     ))}
-                                            </button>
+                                            </div>
                                         </div>
                                     </ContextMenuTrigger>
                                     <ContextMenuContent className="w-44">
@@ -358,17 +363,11 @@ function SortHeader({
 
 function NameCell({
     entry,
-    onOpen,
 }: {
     entry: ListEntry;
-    onOpen: (entry: ListEntry) => void;
 }) {
     return (
-        <button
-            type="button"
-            onClick={() => onOpen(entry)}
-            className="flex min-w-0 items-center gap-2 text-left"
-        >
+        <div className="flex min-w-0 items-center gap-2 text-left">
             <EntryIcon entry={entry} />
             <span className="min-w-0 truncate">{entry.name}</span>
             {entry.favorite ? (
@@ -389,6 +388,6 @@ function NameCell({
                     />
                 </span>
             ) : null}
-        </button>
+        </div>
     );
 }

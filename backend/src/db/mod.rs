@@ -3,8 +3,6 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::session::now_unix;
-
 mod admin;
 mod file_states;
 mod helpers;
@@ -43,9 +41,6 @@ impl AuthDb {
 
         let db = Self { pool };
         db.migrate()
-            .await
-            .map_err(|err| format!("Failed to initialize database: {err}"))?;
-        db.mark_active_resource_accesses_stale()
             .await
             .map_err(|err| format!("Failed to initialize database: {err}"))?;
         Ok(db)
@@ -270,23 +265,6 @@ impl AuthDb {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
             sqlx::query(&sql).execute(&self.pool).await?;
         }
-        Ok(())
-    }
-
-    async fn mark_active_resource_accesses_stale(&self) -> sqlx::Result<()> {
-        let now = now_unix() as i64;
-        sqlx::query(
-            r#"
-            UPDATE resource_access_events
-            SET transfer_state = ?1, updated_at = ?2, ended_at = ?2
-            WHERE transfer_state = ?3
-            "#,
-        )
-        .bind(ResourceTransferState::Stale.as_str())
-        .bind(now)
-        .bind(ResourceTransferState::Active.as_str())
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 }

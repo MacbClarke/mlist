@@ -242,29 +242,36 @@ async fn stream_access_progress_and_finish_accumulate_deltas() {
 }
 
 #[tokio::test]
-async fn startup_marks_leftover_active_events_stale() {
+async fn stale_active_events_marked_stale_on_audit_page() {
     let path = test_db_path("stream-stale");
     let db = AuthDb::connect(&path).await.unwrap();
     let user = db
         .create_user("alice", UserRole::User, "SECRET")
         .await
         .unwrap();
-    db.start_resource_stream_access(RecordResourceAccess {
-        user_id: user.id,
-        kind: ResourceKind::File,
-        path: "movies/demo.mp4".to_string(),
-        route: "/d",
-        status: 200,
-        bytes_served: 0,
-        file_size: Some(1_000),
-        range_start: None,
-        range_end: None,
-    })
-    .await
-    .unwrap();
-    drop(db);
+    let event_id = db
+        .start_resource_stream_access(RecordResourceAccess {
+            user_id: user.id,
+            kind: ResourceKind::File,
+            path: "movies/demo.mp4".to_string(),
+            route: "/d",
+            status: 200,
+            bytes_served: 0,
+            file_size: Some(1_000),
+            range_start: None,
+            range_end: None,
+        })
+        .await
+        .unwrap();
 
-    let db = AuthDb::connect(&path).await.unwrap();
+    let past = crate::session::now_unix() as i64 - 100;
+    sqlx::query("UPDATE resource_access_events SET updated_at = ?1 WHERE id = ?2")
+        .bind(past)
+        .bind(event_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
     let events = db
         .list_access_events_page(Some(user.id), 10, 0)
         .await

@@ -285,6 +285,23 @@ impl AuthDb {
     ) -> ApiResult<Vec<ResourceAccessEventView>> {
         let limit = limit.clamp(1, 501);
         let offset = offset.max(0);
+
+        let now = now_unix() as i64;
+        let stale_cutoff = now.saturating_sub(60);
+        let _ = sqlx::query(
+            r#"
+            UPDATE resource_access_events
+            SET transfer_state = ?1, updated_at = ?2, ended_at = ?2
+            WHERE transfer_state = ?3 AND updated_at < ?4
+            "#,
+        )
+        .bind(ResourceTransferState::Stale.as_str())
+        .bind(now)
+        .bind(ResourceTransferState::Active.as_str())
+        .bind(stale_cutoff)
+        .execute(&self.pool)
+        .await;
+
         let rows = if let Some(user_id) = user_id {
             sqlx::query(
                 r#"

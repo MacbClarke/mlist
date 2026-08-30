@@ -781,21 +781,43 @@ pub(super) struct FileAccessRecorder {
     db: AuthDb,
     event_id: i64,
     bytes_served: AtomicU64,
+    last_activity_at: AtomicI64,
     last_progress_at: AtomicI64,
     finalized: AtomicBool,
 }
 
 const STREAM_PROGRESS_FLUSH_INTERVAL_SECONDS: i64 = 5;
+const STREAM_IDLE_TIMEOUT_SECONDS: i64 = 60;
 
 impl FileAccessRecorder {
     pub(super) fn new(db: AuthDb, event_id: i64) -> Arc<Self> {
-        Arc::new(Self {
+        let now = now_unix() as i64;
+        let recorder = Arc::new(Self {
             db,
             event_id,
             bytes_served: AtomicU64::new(0),
-            last_progress_at: AtomicI64::new(now_unix() as i64),
+            last_activity_at: AtomicI64::new(now),
+            last_progress_at: AtomicI64::new(now),
             finalized: AtomicBool::new(false),
-        })
+        });
+
+        let watchdog = Arc::clone(&recorder);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                if watchdog.finalized.load(Ordering::Acquire) {
+                    break;
+                }
+                let last = watchdog.last_activity_at.load(Ordering::Acquire);
+                let now = now_unix() as i64;
+                if now.saturating_sub(last) >= STREAM_IDLE_TIMEOUT_SECONDS {
+                    watchdog.finalize_in_background(ResourceTransferState::Aborted);
+                    break;
+                }
+            }
+        });
+
+        recorder
     }
 
     fn add_bytes(self: &Arc<Self>, len: usize) {
@@ -805,6 +827,8 @@ impl FileAccessRecorder {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(added))
             });
+        self.last_activity_at
+            .store(now_unix() as i64, Ordering::Release);
         self.maybe_flush_progress();
     }
 
@@ -846,12 +870,24 @@ impl FileAccessRecorder {
 
         tokio::spawn(async move {
             let bytes_served = u64_to_i64(self.bytes_served.load(Ordering::Acquire));
-            if let Err(err) = self
-                .db
-                .finish_resource_stream_access(self.event_id, transfer_state, bytes_served)
-                .await
-            {
-                error!("failed to finalize file stream access: {err:?}");
+            for attempt in 0..3 {
+                match self
+                    .db
+                    .finish_resource_stream_access(self.event_id, transfer_state, bytes_served)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if attempt == 2 {
+                            error!("failed to finalize file stream access: {err:?}");
+                        } else {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                50 * (attempt + 1),
+                            ))
+                            .await;
+                        }
+                    }
+                }
             }
         });
     }

@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { FormEvent } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     ActivityIcon,
     BanIcon,
@@ -46,6 +47,7 @@ import { FormError } from "@/components/FormError";
 import { TotpBindingPanel } from "@/components/TotpBindingPanel";
 import { AuditView } from "@/views/AuditView";
 import { apiJson } from "@/api";
+import { queryKeys } from "@/lib/queryClient";
 import { formatBytes, formatDate } from "@/lib/format";
 import type { TotpBinding, UserRole, UserView, UsersResponse } from "@/types";
 
@@ -56,29 +58,21 @@ export function AdminView({
     currentUser: UserView;
     onUserChanged: (user: UserView) => void;
 }) {
-    const [users, setUsers] = useState<UserView[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState("");
+    const queryClient = useQueryClient();
+    const {
+        data,
+        isLoading: loading,
+        error: queryError,
+    } = useQuery({
+        queryKey: queryKeys.adminUsers(),
+        queryFn: () => apiJson<UsersResponse>("/api/admin/users"),
+    });
+    const users = data?.users ?? [];
+    const error = queryError instanceof Error ? queryError.message : "";
+
     const [createOpen, setCreateOpen] = useState(false);
     const [binding, setBinding] = useState<TotpBinding | null>(null);
     const [auditUserId, setAuditUserId] = useState("all");
-
-    useEffect(() => {
-        void loadUsers();
-    }, []);
-
-    async function loadUsers() {
-        setLoading(true);
-        setError("");
-        try {
-            const payload = await apiJson<UsersResponse>("/api/admin/users");
-            setUsers(payload.users);
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "用户加载失败");
-        } finally {
-            setLoading(false);
-        }
-    }
 
     async function toggleUser(target: UserView) {
         const action = target.enabled ? "disable" : "enable";
@@ -89,10 +83,17 @@ export function AdminView({
                     method: "POST",
                 },
             );
-            setUsers((previous) =>
-                previous.map((item) =>
-                    item.id === updated.id ? updated : item,
-                ),
+            queryClient.setQueryData<UsersResponse>(
+                queryKeys.adminUsers(),
+                (previous) =>
+                    previous
+                        ? {
+                              ...previous,
+                              users: previous.users.map((item) =>
+                                  item.id === updated.id ? updated : item,
+                              ),
+                          }
+                        : previous,
             );
             if (updated.id === currentUser.id) onUserChanged(updated);
         } catch (err) {
@@ -109,7 +110,9 @@ export function AdminView({
                 },
             );
             setBinding(payload);
-            await loadUsers();
+            await queryClient.invalidateQueries({
+                queryKey: queryKeys.adminUsers(),
+            });
         } catch (err) {
             toast.error(err instanceof Error ? err.message : "重置失败");
         }
@@ -132,8 +135,17 @@ export function AdminView({
             await apiJson<{ ok: boolean }>(`/api/admin/users/${target.id}`, {
                 method: "DELETE",
             });
-            setUsers((previous) =>
-                previous.filter((item) => item.id !== target.id),
+            queryClient.setQueryData<UsersResponse>(
+                queryKeys.adminUsers(),
+                (previous) =>
+                    previous
+                        ? {
+                              ...previous,
+                              users: previous.users.filter(
+                                  (item) => item.id !== target.id,
+                              ),
+                          }
+                        : previous,
             );
             if (auditUserId === String(target.id)) setAuditUserId("all");
             toast.success("用户已删除");
@@ -346,7 +358,9 @@ export function AdminView({
                 onCreated={(payload) => {
                     setBinding(payload);
                     setCreateOpen(false);
-                    void loadUsers();
+                    void queryClient.invalidateQueries({
+                        queryKey: queryKeys.adminUsers(),
+                    });
                 }}
             />
             <BindingDialog binding={binding} onClose={() => setBinding(null)} />

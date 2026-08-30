@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -9,37 +9,17 @@ import {
     isPlainTextFile,
 } from "@/lib/fileTypes";
 import { useRemoteTextContent } from "@/hooks/useRemoteTextContent";
+import { queryKeys } from "@/lib/queryClient";
 
 export function FilePreview({ entry }: { entry: ListEntry }) {
-    const [preview, setPreview] = useState({
-        path: entry.path,
-        url: "",
-        error: "",
+    const { data, isLoading, error } = useQuery({
+        queryKey: queryKeys.signedLink(entry.path),
+        queryFn: () => createSignedFileLink(entry.path),
+        staleTime: 4 * 60 * 1000,
+        enabled: Boolean(entry.path),
     });
 
-    useEffect(() => {
-        let active = true;
-        createSignedFileLink(entry.path)
-            .then((payload) => {
-                if (!active) return;
-                setPreview({ path: entry.path, url: payload.url, error: "" });
-            })
-            .catch((err) => {
-                if (!active) return;
-                setPreview({
-                    path: entry.path,
-                    url: "",
-                    error: err instanceof Error ? err.message : "加载预览失败",
-                });
-            });
-        return () => {
-            active = false;
-        };
-    }, [entry.path]);
-
-    const loading = preview.path !== entry.path;
-
-    if (loading) {
+    if (isLoading) {
         return (
             <div className="text-muted-foreground flex min-h-[45vh] items-center justify-center text-sm">
                 正在加载预览...
@@ -47,15 +27,15 @@ export function FilePreview({ entry }: { entry: ListEntry }) {
         );
     }
 
-    if (preview.error || !preview.url) {
+    if (error || !data?.url) {
         return (
             <div className="text-muted-foreground flex min-h-[45vh] items-center justify-center text-sm">
-                {preview.error || "加载预览失败"}
+                {error instanceof Error ? error.message : "加载预览失败"}
             </div>
         );
     }
 
-    return renderPreview(entry, preview.url);
+    return renderPreview(entry, data.url);
 }
 
 function renderPreview(entry: ListEntry, previewUrl: string) {

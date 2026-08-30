@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
     ActivityIcon,
     AlertCircleIcon,
@@ -35,6 +36,7 @@ import {
 import { FormError } from "@/components/FormError";
 import { formatBytes, formatDate, formatRange } from "@/lib/format";
 import { apiJson } from "@/api";
+import { queryKeys } from "@/lib/queryClient";
 import {
     AUDIT_PAGE_SIZE,
     type AuditEventsResponse,
@@ -53,96 +55,74 @@ export function AuditView({
     selectedUserId: string;
     onUserChange: (value: string) => void;
 }) {
-    const [events, setEvents] = useState<ResourceAccessEvent[]>([]);
-    const [resources, setResources] = useState<ResourceUsage[]>([]);
     const [eventsPage, setEventsPage] = useState(0);
     const [resourcesPage, setResourcesPage] = useState(0);
-    const [eventsHasMore, setEventsHasMore] = useState(false);
-    const [resourcesHasMore, setResourcesHasMore] = useState(false);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState("");
-    const auditRequestRef = useRef(0);
-    const auditInFlightRef = useRef(0);
 
-    const loadAudit = useCallback(
-        async (showLoading = true, skipIfBusy = false) => {
-            if (skipIfBusy && auditInFlightRef.current > 0) return;
-            auditInFlightRef.current += 1;
-            const requestId = auditRequestRef.current + 1;
-            auditRequestRef.current = requestId;
-            if (showLoading) {
-                setLoading(true);
+    const activeUserId = selectedUserId !== "all" ? selectedUserId : undefined;
+
+    const eventsQuery = useQuery({
+        queryKey: queryKeys.adminAuditEvents({
+            userId: activeUserId,
+            offset: eventsPage * AUDIT_PAGE_SIZE,
+            limit: AUDIT_PAGE_SIZE,
+        }),
+        queryFn: async ({ signal }) => {
+            const params = new URLSearchParams({
+                limit: String(AUDIT_PAGE_SIZE),
+                offset: String(eventsPage * AUDIT_PAGE_SIZE),
+            });
+            if (activeUserId) {
+                params.set("userId", activeUserId);
             }
-            setError("");
-            try {
-                const baseQuery = new URLSearchParams({
-                    limit: String(AUDIT_PAGE_SIZE),
-                });
-                if (selectedUserId !== "all") {
-                    baseQuery.set("userId", selectedUserId);
-                }
-                const eventsQuery = new URLSearchParams(baseQuery);
-                eventsQuery.set("offset", String(eventsPage * AUDIT_PAGE_SIZE));
-                const resourcesQuery = new URLSearchParams(baseQuery);
-                resourcesQuery.set(
-                    "offset",
-                    String(resourcesPage * AUDIT_PAGE_SIZE),
-                );
-                const [eventsPayload, resourcesPayload] = await Promise.all([
-                    apiJson<AuditEventsResponse>(
-                        `/api/admin/audit/events?${eventsQuery}`,
-                    ),
-                    apiJson<AuditResourcesResponse>(
-                        `/api/admin/audit/resources?${resourcesQuery}`,
-                    ),
-                ]);
-                if (auditRequestRef.current !== requestId) return;
-                setEvents(eventsPayload.events);
-                setResources(resourcesPayload.resources);
-                setEventsHasMore(eventsPayload.hasMore);
-                setResourcesHasMore(resourcesPayload.hasMore);
-            } catch (err) {
-                if (auditRequestRef.current === requestId) {
-                    setError(
-                        err instanceof Error ? err.message : "审计数据加载失败",
-                    );
-                }
-            } finally {
-                if (showLoading && auditRequestRef.current === requestId) {
-                    setLoading(false);
-                }
-                auditInFlightRef.current = Math.max(
-                    0,
-                    auditInFlightRef.current - 1,
-                );
-            }
+            return apiJson<AuditEventsResponse>(
+                `/api/admin/audit/events?${params.toString()}`,
+                { signal },
+            );
         },
-        [eventsPage, resourcesPage, selectedUserId],
-    );
+        refetchInterval: 5000,
+    });
 
-    useEffect(() => {
-        let cancelled = false;
-        let timer: number | undefined;
-
-        async function loadAndSchedule(showLoading: boolean) {
-            await loadAudit(showLoading, !showLoading);
-            if (cancelled) return;
-            timer = window.setTimeout(() => void loadAndSchedule(false), 5000);
-        }
-
-        void loadAndSchedule(true);
-        return () => {
-            cancelled = true;
-            if (timer !== undefined) {
-                window.clearTimeout(timer);
+    const resourcesQuery = useQuery({
+        queryKey: queryKeys.adminAuditResources({
+            userId: activeUserId,
+            offset: resourcesPage * AUDIT_PAGE_SIZE,
+            limit: AUDIT_PAGE_SIZE,
+        }),
+        queryFn: async ({ signal }) => {
+            const params = new URLSearchParams({
+                limit: String(AUDIT_PAGE_SIZE),
+                offset: String(resourcesPage * AUDIT_PAGE_SIZE),
+            });
+            if (activeUserId) {
+                params.set("userId", activeUserId);
             }
-        };
-    }, [loadAudit]);
+            return apiJson<AuditResourcesResponse>(
+                `/api/admin/audit/resources?${params.toString()}`,
+                { signal },
+            );
+        },
+        refetchInterval: 5000,
+    });
+
+    const events = eventsQuery.data?.events ?? [];
+    const resources = resourcesQuery.data?.resources ?? [];
+    const eventsHasMore = eventsQuery.data?.hasMore ?? false;
+    const resourcesHasMore = resourcesQuery.data?.hasMore ?? false;
+    const loading = eventsQuery.isLoading || resourcesQuery.isLoading;
+    const isFetching = eventsQuery.isFetching || resourcesQuery.isFetching;
+
+    const queryError = eventsQuery.error ?? resourcesQuery.error;
+    const error =
+        queryError instanceof Error ? queryError.message : "";
 
     function handleUserChange(value: string) {
         setEventsPage(0);
         setResourcesPage(0);
         onUserChange(value);
+    }
+
+    async function handleManualRefresh() {
+        await Promise.all([eventsQuery.refetch(), resourcesQuery.refetch()]);
     }
 
     return (
@@ -163,11 +143,11 @@ export function AuditView({
                 </Select>
                 <Button
                     variant="outline"
-                    onClick={() => void loadAudit()}
+                    onClick={() => void handleManualRefresh()}
                     disabled={loading}
                 >
                     <RefreshCwIcon
-                        className={`size-4 ${loading ? "animate-spin" : ""}`}
+                        className={`size-4 ${isFetching ? "animate-spin" : ""}`}
                     />
                     刷新
                 </Button>

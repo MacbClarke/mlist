@@ -28,6 +28,7 @@ import {
     refreshAccessToken,
     setAccessToken,
 } from "@/api";
+import { queryClient, queryKeys } from "@/lib/queryClient";
 import {
     browserPath,
     isAdminPath,
@@ -171,6 +172,42 @@ function App() {
         }
     }
 
+    function applyListPayload(
+        payload: ListResponse,
+        requestedPreviewPath: string | null | undefined,
+        options: LoadPathOptions,
+    ) {
+        const safeEntries = payload.entries.filter(
+            (item) => item.name !== ".private",
+        );
+        let resolvedPreviewPath: string | null = null;
+        if (requestedPreviewPath !== undefined) {
+            const previewCandidate = requestedPreviewPath
+                ? (safeEntries.find(
+                      (item) =>
+                          item.kind === "file" &&
+                          normalizePath(item.path) === requestedPreviewPath,
+                  ) ?? null)
+                : null;
+            setPreviewEntry(previewCandidate);
+            resolvedPreviewPath = previewCandidate?.path ?? null;
+        } else {
+            setPreviewEntry(null);
+        }
+
+        setEntries(safeEntries);
+        setTotal(payload.total ?? 0);
+        setHasMore(payload.hasMore ?? false);
+        setCurrentPath(payload.path);
+        if (options.updateUrl !== false) {
+            syncBrowserState(
+                payload.path,
+                resolvedPreviewPath,
+                options.replaceUrl === true,
+            );
+        }
+    }
+
     async function loadPath(path: string, options: LoadPathOptions = {}) {
         clearSearchDebounce();
         const requestPath = normalizePath(path);
@@ -195,7 +232,23 @@ function App() {
         if (options.resetOffset && pagination.offset !== 0) {
             setPagination((previous) => ({ ...previous, offset: 0 }));
         }
-        setLoading(true);
+
+        const queryKey = queryKeys.list({
+            path: requestPath,
+            sort: effectiveSort || undefined,
+            order: effectiveOrder || undefined,
+            offset: effectiveOffset,
+            limit: pagination.limit,
+            favoritesOnly: effectiveView === "favorites" ? true : undefined,
+            search: effectiveSearch.trim() || undefined,
+        });
+
+        const cachedPayload = queryClient.getQueryData<ListResponse>(queryKey);
+        if (cachedPayload) {
+            applyListPayload(cachedPayload, requestedPreviewPath, options);
+        } else {
+            setLoading(true);
+        }
         setError("");
         setPathNotFound(false);
 
@@ -213,38 +266,14 @@ function App() {
             if (effectiveSearch.trim()) {
                 params.set("search", effectiveSearch.trim());
             }
-            const payload = await apiJson<ListResponse>(
-                `/api/list?${params.toString()}`,
-            );
-            const safeEntries = payload.entries.filter(
-                (item) => item.name !== ".private",
-            );
-            let resolvedPreviewPath: string | null = null;
-            if (requestedPreviewPath !== undefined) {
-                const previewCandidate = requestedPreviewPath
-                    ? (safeEntries.find(
-                          (item) =>
-                              item.kind === "file" &&
-                              normalizePath(item.path) === requestedPreviewPath,
-                      ) ?? null)
-                    : null;
-                setPreviewEntry(previewCandidate);
-                resolvedPreviewPath = previewCandidate?.path ?? null;
-            } else {
-                setPreviewEntry(null);
-            }
 
-            setEntries(safeEntries);
-            setTotal(payload.total ?? 0);
-            setHasMore(payload.hasMore ?? false);
-            setCurrentPath(payload.path);
-            if (options.updateUrl !== false) {
-                syncBrowserState(
-                    payload.path,
-                    resolvedPreviewPath,
-                    options.replaceUrl === true,
-                );
-            }
+            const payload = await queryClient.fetchQuery({
+                queryKey,
+                queryFn: () =>
+                    apiJson<ListResponse>(`/api/list?${params.toString()}`),
+                staleTime: 30 * 1000,
+            });
+            applyListPayload(payload, requestedPreviewPath, options);
         } catch (err) {
             if (
                 err instanceof ApiRequestError &&
@@ -311,6 +340,7 @@ function App() {
         await apiJson<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
         setAccessToken(null);
         setUser(null);
+        queryClient.clear();
         setEntries([]);
         setPreviewEntry(null);
         setCurrentPath("");
@@ -326,7 +356,11 @@ function App() {
     }
 
     async function loadHighlightedFilesFromServer() {
-        const payload = await apiJson<FileStatesResponse>("/api/file-states");
+        const payload = await queryClient.fetchQuery({
+            queryKey: queryKeys.fileStates(),
+            queryFn: () => apiJson<FileStatesResponse>("/api/file-states"),
+            staleTime: 60 * 1000,
+        });
         setHighlightedFiles(
             new Set(
                 payload.files
@@ -433,10 +467,17 @@ function App() {
             method: "POST",
             body: JSON.stringify({ path, highlighted }),
         });
+        void queryClient.invalidateQueries({
+            queryKey: queryKeys.fileStates(),
+        });
     }
 
     async function loadFavoriteFilesFromServer() {
-        const payload = await apiJson<FavoritesResponse>("/api/favorites");
+        const payload = await queryClient.fetchQuery({
+            queryKey: queryKeys.favorites(),
+            queryFn: () => apiJson<FavoritesResponse>("/api/favorites"),
+            staleTime: 60 * 1000,
+        });
         setFavoriteFiles(
             new Set(
                 payload.paths
@@ -459,6 +500,12 @@ function App() {
                     path: normalizedPath,
                     favorite: nextFavorite,
                 }),
+            });
+            void queryClient.invalidateQueries({
+                queryKey: queryKeys.favorites(),
+            });
+            void queryClient.invalidateQueries({
+                queryKey: ["list"],
             });
             setFavoriteFiles((previous) => {
                 const next = new Set(previous);
@@ -711,9 +758,12 @@ function App() {
                 <Button
                     variant="outline"
                     size="icon"
-                    onClick={() =>
-                        void loadPath(currentPath, { resetOffset: true })
-                    }
+                    onClick={() => {
+                        void queryClient.invalidateQueries({
+                            queryKey: ["list"],
+                        });
+                        void loadPath(currentPath, { resetOffset: true });
+                    }}
                     disabled={loading}
                     aria-label="刷新"
                     title="刷新"

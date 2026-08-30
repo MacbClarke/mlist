@@ -419,13 +419,16 @@ function App() {
             await copyBatchDownloadLink([entry.path], zipName);
             return;
         }
+        const toastId = toast.loading("正在生成下载链接...");
         try {
             const payload = await createSignedFileLink(entry.path);
+            toast.dismiss(toastId);
             const url = toAbsoluteUrl(payload.url);
             await navigator.clipboard.writeText(url);
             await markFileHighlighted(entry.path);
-            toast.success("已复制");
+            toast.success("已复制下载链接");
         } catch {
+            toast.dismiss(toastId);
             toast.error("复制失败，请检查浏览器剪贴板权限。");
         }
     }
@@ -452,15 +455,22 @@ function App() {
     }
 
     async function downloadFile(entry: ListEntry) {
-        const payload = await createSignedFileLink(entry.path);
-        void markFileHighlighted(entry.path);
-        const anchor = document.createElement("a");
-        anchor.href = payload.url;
-        anchor.download = entry.name;
-        anchor.rel = "noreferrer";
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
+        const toastId = toast.loading("正在准备下载...");
+        try {
+            const payload = await createSignedFileLink(entry.path);
+            toast.dismiss(toastId);
+            void markFileHighlighted(entry.path);
+            const anchor = document.createElement("a");
+            anchor.href = payload.url;
+            anchor.download = entry.name;
+            anchor.rel = "noreferrer";
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+        } catch (err) {
+            toast.dismiss(toastId);
+            toast.error(err instanceof Error ? err.message : "准备下载失败");
+        }
     }
 
     async function downloadEntry(entry: ListEntry) {

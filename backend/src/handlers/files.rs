@@ -1,23 +1,30 @@
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::UNIX_EPOCH;
 
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use futures_core::Stream;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::ReaderStream;
 use tracing::error;
 
 use crate::auth::{find_private_anchor, has_private_hide_marker};
-use crate::db::{AuthDb, AuthSession, RecordResourceAccess, ResourceKind, ResourceTransferState};
+use crate::db::{
+    AuthDb, AuthSession, BatchTokenPayload, RecordResourceAccess, ResourceKind,
+    ResourceTransferState,
+};
 use crate::errors::{ApiError, ApiResult};
 use crate::path_guard::{
     ensure_not_marker_path, is_private_marker_name, normalize_relative_path, resolve_existing_path,
@@ -26,13 +33,13 @@ use crate::session::now_unix;
 
 use super::helpers::{file_name_is_marker, file_session_for_request, require_session};
 use super::http_util::{
-    ByteRange, build_not_modified, build_range_not_satisfiable, content_disposition_inline,
-    format_http_date, if_none_match_matches, if_range_matches, make_etag, parse_range_header,
-    signed_direct_file_url,
+    ByteRange, build_not_modified, build_range_not_satisfiable, content_disposition_attachment,
+    content_disposition_inline, format_http_date, if_none_match_matches, if_range_matches,
+    make_etag, parse_range_header, signed_direct_file_url,
 };
 use super::types::{
-    AppState, DirectFileQuery, ListEntry, ListResponse, PathQuery, SignedFileLinkRequest,
-    SignedFileLinkResponse,
+    AppState, DirectBatchQuery, DirectFileQuery, ListEntry, ListResponse, PathQuery,
+    SignedBatchLinkRequest, SignedBatchLinkResponse, SignedFileLinkRequest, SignedFileLinkResponse,
 };
 use crate::session::unix_to_rfc3339;
 
@@ -304,6 +311,319 @@ pub async fn create_file_link_handler(
         url: signed_direct_file_url(&path, &token),
         expires_at: unix_to_rfc3339(expires_at as u64),
     }))
+}
+
+pub async fn create_batch_link_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SignedBatchLinkRequest>,
+) -> ApiResult<Json<SignedBatchLinkResponse>> {
+    let session = require_session(&state, &headers).await?;
+    if payload.paths.is_empty() {
+        return Err(ApiError::bad_request("Paths cannot be empty."));
+    }
+    if payload.paths.len() > 1000 {
+        return Err(ApiError::bad_request(
+            "Too many paths in a single batch request (max 1000).",
+        ));
+    }
+
+    let base_path = match payload.base_path.as_deref() {
+        Some(bp) if !bp.trim().is_empty() => Some(normalize_relative_path(Some(bp))?),
+        _ => None,
+    };
+
+    let mut normalized_paths = Vec::with_capacity(payload.paths.len());
+    let root = &state.config.root_dir;
+
+    for raw_path in &payload.paths {
+        let norm = normalize_relative_path(Some(raw_path))?;
+        ensure_not_marker_path(&norm)?;
+
+        let resolved = resolve_existing_path(root, &norm).await?;
+        let metadata = fs::metadata(&resolved)
+            .await
+            .map_err(|err| ApiError::from_io(err, "file or directory"))?;
+
+        let anchor = find_private_anchor(root, &resolved, metadata.is_dir()).await?;
+        if anchor.is_some() && !session.user.role.is_admin() {
+            return Err(ApiError::not_found("Path not found or access denied."));
+        }
+        normalized_paths.push(norm);
+    }
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let batch_payload = BatchTokenPayload {
+        paths: normalized_paths,
+        base_path,
+        name: payload.name,
+    };
+
+    let expires_at = state
+        .db
+        .create_signed_batch_token(
+            session.user.id,
+            &batch_payload,
+            &token,
+            state.config.signed_file_link_ttl_seconds,
+        )
+        .await?;
+
+    Ok(Json(SignedBatchLinkResponse {
+        url: format!("/api/batch-download?token={token}"),
+        expires_at: unix_to_rfc3339(expires_at as u64),
+    }))
+}
+
+pub async fn batch_download_handler(
+    State(state): State<AppState>,
+    Query(query): Query<DirectBatchQuery>,
+) -> ApiResult<Response> {
+    let Some((session, batch_payload)) = state.db.signed_batch_session(&query.token).await? else {
+        return Err(ApiError::unauthorized("Invalid or expired download token."));
+    };
+
+    let root = &state.config.root_dir;
+    let is_admin = session.user.role.is_admin();
+    let files = collect_files_for_zip(
+        root,
+        is_admin,
+        &batch_payload.paths,
+        batch_payload.base_path.as_deref(),
+    )
+    .await?;
+
+    if files.is_empty() {
+        return Err(ApiError::bad_request("No accessible files to download."));
+    }
+
+    let raw_zip_name = if let Some(custom_name) = batch_payload.name {
+        if custom_name.to_lowercase().ends_with(".zip") {
+            custom_name
+        } else {
+            format!("{custom_name}.zip")
+        }
+    } else if batch_payload.paths.len() == 1 {
+        let single = &batch_payload.paths[0];
+        let file_stem = single.rsplit_once('/').map(|(_, name)| name).unwrap_or(single);
+        format!("{file_stem}.zip")
+    } else {
+        "download.zip".to_string()
+    };
+
+    let (mut duplex_writer, duplex_reader) = tokio::io::duplex(64 * 1024);
+
+    tokio::spawn(async move {
+        let mut zip_writer = ZipFileWriter::with_tokio(&mut duplex_writer);
+        for item in files {
+            let file = match tokio::fs::File::open(&item.resolved_path).await {
+                Ok(f) => f,
+                Err(err) => {
+                    tracing::warn!(path = ?item.resolved_path, "failed to open file for streaming zip: {err}");
+                    continue;
+                }
+            };
+
+            let builder = ZipEntryBuilder::new(item.zip_rel_path.into(), Compression::Deflate);
+            let entry_writer = match zip_writer.write_entry_stream(builder).await {
+                Ok(w) => w,
+                Err(err) => {
+                    tracing::warn!("failed to create zip entry stream: {err}");
+                    break;
+                }
+            };
+
+            let mut compat_writer = entry_writer.compat_write();
+            let mut file_reader = file;
+            if let Err(err) = tokio::io::copy(&mut file_reader, &mut compat_writer).await {
+                tracing::warn!("failed to stream file into zip: {err}");
+                break;
+            }
+
+            let entry_writer = compat_writer.into_inner();
+            if let Err(err) = entry_writer.close().await {
+                tracing::warn!("failed to close zip entry writer: {err}");
+                break;
+            }
+        }
+
+        if let Err(err) = zip_writer.close().await {
+            tracing::warn!("failed to close zip archive writer: {err}");
+        }
+    });
+
+    let audit_path = if batch_payload.paths.len() == 1 {
+        batch_payload.paths[0].clone()
+    } else {
+        format!("batch:{} items", batch_payload.paths.len())
+    };
+
+    let event_id = state
+        .db
+        .start_resource_stream_access(RecordResourceAccess {
+            user_id: session.user.id,
+            kind: ResourceKind::File,
+            path: audit_path,
+            route: "/api/batch-download",
+            status: StatusCode::OK.as_u16(),
+            bytes_served: 0,
+            file_size: None,
+            range_start: None,
+            range_end: None,
+        })
+        .await?;
+    let recorder = FileAccessRecorder::new(state.db.clone(), event_id);
+
+    let stream = CountingFileStream::new(duplex_reader, recorder);
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition_attachment(&raw_zip_name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download.zip\"")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+
+    Ok(response)
+}
+
+struct ZipItem {
+    resolved_path: PathBuf,
+    zip_rel_path: String,
+}
+
+async fn collect_files_for_zip(
+    root: &Path,
+    is_admin: bool,
+    paths: &[String],
+    base_path: Option<&str>,
+) -> ApiResult<Vec<ZipItem>> {
+    let mut items = Vec::new();
+    let mut seen_zip_paths = HashSet::new();
+
+    for raw_path in paths {
+        let norm = normalize_relative_path(Some(raw_path))?;
+        ensure_not_marker_path(&norm)?;
+
+        let resolved = resolve_existing_path(root, &norm).await?;
+        let metadata = fs::metadata(&resolved)
+            .await
+            .map_err(|err| ApiError::from_io(err, "file or directory"))?;
+
+        let anchor = find_private_anchor(root, &resolved, metadata.is_dir()).await?;
+        if anchor.is_some() && !is_admin {
+            continue;
+        }
+
+        if metadata.is_file() {
+            let zip_rel = make_zip_path(&norm, base_path, true);
+            let unique_zip_path = make_unique_path(zip_rel, &mut seen_zip_paths);
+            items.push(ZipItem {
+                resolved_path: resolved,
+                zip_rel_path: unique_zip_path,
+            });
+        } else if metadata.is_dir() {
+            let mut queue = VecDeque::new();
+            queue.push_back((resolved.clone(), norm.clone()));
+
+            while let Some((dir_resolved, dir_rel)) = queue.pop_front() {
+                let mut read_dir = match fs::read_dir(&dir_resolved).await {
+                    Ok(rd) => rd,
+                    Err(err) => {
+                        tracing::warn!("failed to read directory for zip: {err}");
+                        continue;
+                    }
+                };
+
+                while let Ok(Some(entry)) = read_dir.next_entry().await {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if is_private_marker_name(&file_name) {
+                        continue;
+                    }
+
+                    let entry_resolved = entry.path();
+                    let entry_rel = if dir_rel.is_empty() {
+                        file_name.clone()
+                    } else {
+                        format!("{dir_rel}/{file_name}")
+                    };
+
+                    let entry_type = match entry.file_type().await {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+
+                    let anchor =
+                        find_private_anchor(root, &entry_resolved, entry_type.is_dir()).await?;
+                    if anchor.is_some() && !is_admin {
+                        continue;
+                    }
+
+                    if entry_type.is_dir() {
+                        queue.push_back((entry_resolved, entry_rel));
+                    } else if entry_type.is_file() {
+                        let zip_rel = make_zip_path(&entry_rel, base_path, false);
+                        let unique_zip_path = make_unique_path(zip_rel, &mut seen_zip_paths);
+                        items.push(ZipItem {
+                            resolved_path: entry_resolved,
+                            zip_rel_path: unique_zip_path,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn make_zip_path(rel_path: &str, base_path: Option<&str>, is_direct_file: bool) -> String {
+    if let Some(base) = base_path {
+        let trimmed_base = base.trim_matches('/');
+        if !trimmed_base.is_empty() {
+            if let Some(stripped) = rel_path.strip_prefix(trimmed_base) {
+                let clean = stripped.trim_matches('/');
+                if !clean.is_empty() {
+                    return clean.to_string();
+                }
+            }
+        }
+    }
+
+    if is_direct_file {
+        if let Some((_, name)) = rel_path.rsplit_once('/') {
+            return name.to_string();
+        }
+    }
+
+    rel_path.trim_matches('/').to_string()
+}
+
+fn make_unique_path(path: String, seen: &mut HashSet<String>) -> String {
+    if seen.insert(path.clone()) {
+        return path;
+    }
+    let (stem, ext) = match path.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (path.clone(), String::new()),
+    };
+    let mut counter = 1;
+    loop {
+        let candidate = format!("{stem} ({counter}){ext}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        counter += 1;
+    }
 }
 
 async fn serve_file_response(

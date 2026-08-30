@@ -9,6 +9,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use axum::http::HeaderMap;
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
 
 use crate::db::{AuthDb, RecordResourceAccess, ResourceKind, UserRole};
 
@@ -64,6 +66,100 @@ fn favorites_view_shows_descendants_of_favorite_directory() {
         false,
         &favorites
     ));
+}
+
+#[tokio::test]
+async fn test_streaming_zip() {
+    use tokio_util::compat::FuturesAsyncWriteCompatExt;
+
+    let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut zip_writer = ZipFileWriter::with_tokio(&mut writer);
+        let builder = ZipEntryBuilder::new("hello.txt".into(), Compression::Deflate);
+        let entry_writer = zip_writer.write_entry_stream(builder).await.unwrap();
+        let mut compat_writer = entry_writer.compat_write();
+        tokio::io::copy(&mut &b"hello world"[..], &mut compat_writer).await.unwrap();
+        let entry_writer = compat_writer.into_inner();
+        entry_writer.close().await.unwrap();
+        zip_writer.close().await.unwrap();
+    });
+
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output).await.unwrap();
+    assert!(!output.is_empty());
+}
+
+#[tokio::test]
+async fn test_batch_download_flow() {
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::Json;
+    use super::files::{batch_download_handler, create_batch_link_handler};
+    use super::types::{AppState, DirectBatchQuery, SignedBatchLinkRequest};
+    use crate::config::AppConfig;
+    use crate::session::LoginRateLimiter;
+    use std::sync::Arc;
+
+    let root_dir = test_path("batch_root", "d");
+    tokio::fs::create_dir_all(root_dir.join("sub")).await.unwrap();
+    tokio::fs::write(root_dir.join("a.txt"), b"hello a").await.unwrap();
+    tokio::fs::write(root_dir.join("sub/b.txt"), b"hello b").await.unwrap();
+
+    let db_path = test_path("batch_db", "sqlite3");
+    let db = AuthDb::connect(&db_path).await.unwrap();
+    let user = db.create_user("bob", UserRole::Admin, "SECRET").await.unwrap();
+
+    let config = Arc::new(AppConfig {
+        root_dir: root_dir.clone(),
+        database_path: db_path.clone(),
+        ..AppConfig::default()
+    });
+
+    let state = AppState {
+        config,
+        db: db.clone(),
+        login_limiter: LoginRateLimiter::new(5, 60),
+    };
+
+    db.create_access_token(user.id, "TEST_TOKEN", 3600).await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        "Bearer TEST_TOKEN".parse().unwrap(),
+    );
+
+    let req = SignedBatchLinkRequest {
+        paths: vec!["a.txt".to_string(), "sub".to_string()],
+        base_path: None,
+        name: Some("my_archive.zip".to_string()),
+    };
+    let Json(resp) = create_batch_link_handler(State(state.clone()), headers, Json(req))
+        .await
+        .unwrap();
+
+    assert!(resp.url.starts_with("/api/batch-download?token="));
+    let token = resp.url.strip_prefix("/api/batch-download?token=").unwrap();
+
+    let query = DirectBatchQuery {
+        token: token.to_string(),
+    };
+    let response = batch_download_handler(State(state), Query(query))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/zip"
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!body_bytes.is_empty());
+
+    let _ = tokio::fs::remove_dir_all(&root_dir).await;
+    let _ = tokio::fs::remove_file(&db_path).await;
 }
 
 #[test]

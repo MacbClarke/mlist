@@ -145,6 +145,26 @@ pub struct SignedFileLinkResponse {
     pub expires_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedBatchLinkRequest {
+    pub paths: Vec<String>,
+    pub base_path: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedBatchLinkResponse {
+    pub url: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DirectBatchQuery {
+    pub token: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TotpBindingResponse {

@@ -2,6 +2,7 @@ import type {
     ApiError,
     MeResponse,
     RefreshResponse,
+    SignedBatchLinkResponse,
     SignedFileLinkResponse,
 } from "@/types";
 
@@ -104,5 +105,16 @@ export async function createSignedFileLink(
     return apiJson<SignedFileLinkResponse>("/api/file-link", {
         method: "POST",
         body: JSON.stringify({ path }),
+    });
+}
+
+export async function createSignedBatchLink(
+    paths: string[],
+    basePath?: string,
+    name?: string,
+): Promise<SignedBatchLinkResponse> {
+    return apiJson<SignedBatchLinkResponse>("/api/batch-link", {
+        method: "POST",
+        body: JSON.stringify({ paths, basePath, name }),
     });
 }

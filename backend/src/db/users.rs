@@ -7,7 +7,7 @@ use super::helpers::{
     db_error, fetch_user_by_username_from, hash_token, is_unique_violation, user_from_row,
     validate_username,
 };
-use super::types::{AuthSession, UserRecord, UserView, UserRole};
+use super::types::{AuthSession, BatchTokenPayload, UserRecord, UserRole, UserView};
 use super::AuthDb;
 
 impl AuthDb {
@@ -384,6 +384,88 @@ impl AuthDb {
             user,
             expires_at: row.get("expires_at"),
         }))
+    }
+
+    pub async fn create_signed_batch_token(
+        &self,
+        user_id: i64,
+        payload: &BatchTokenPayload,
+        token: &str,
+        ttl_seconds: u64,
+    ) -> ApiResult<i64> {
+        let serialized = serde_json::to_string(payload)
+            .map_err(|err| ApiError::internal(format!("Failed to serialize batch payload: {err}")))?;
+        let path = format!("batch:{serialized}");
+        self.create_signed_file_token(user_id, &path, token, ttl_seconds)
+            .await
+    }
+
+    pub async fn signed_batch_session(
+        &self,
+        token: &str,
+    ) -> ApiResult<Option<(AuthSession, BatchTokenPayload)>> {
+        let now = now_unix() as i64;
+        sqlx::query("DELETE FROM signed_file_tokens WHERE expires_at <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+
+        let token_hash = hash_token(token);
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT
+                t.expires_at, t.path,
+                u.id, u.username, u.role, u.totp_secret, u.enabled,
+                u.created_at, u.updated_at, u.last_login_at, u.last_seen_at,
+                COALESCE(SUM(uru.total_bytes_served), 0) AS total_bytes_served
+            FROM signed_file_tokens t
+            JOIN users u ON u.id = t.user_id
+            LEFT JOIN user_resource_usage uru ON uru.user_id = u.id
+            WHERE t.token_hash = ?1 AND t.expires_at > ?2
+            GROUP BY t.token_hash
+            "#,
+        )
+        .bind(&token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        else {
+            return Ok(None);
+        };
+
+        let db_path: String = row.get("path");
+        let Some(json_str) = db_path.strip_prefix("batch:") else {
+            return Ok(None);
+        };
+        let payload: BatchTokenPayload = serde_json::from_str(json_str)
+            .map_err(|err| ApiError::internal(format!("Invalid batch token payload: {err}")))?;
+
+        let user = user_from_row(&row)?;
+        if !user.enabled {
+            sqlx::query("DELETE FROM signed_file_tokens WHERE user_id = ?1")
+                .bind(user.id)
+                .execute(&self.pool)
+                .await
+                .map_err(db_error)?;
+            return Ok(None);
+        }
+
+        sqlx::query("UPDATE signed_file_tokens SET last_used_at = ?1 WHERE token_hash = ?2")
+            .bind(now)
+            .bind(&token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+
+        Ok(Some((
+            AuthSession {
+                user,
+                expires_at: row.get("expires_at"),
+            },
+            payload,
+        )))
     }
 
     pub async fn remove_refresh_session(&self, token: &str) -> ApiResult<()> {

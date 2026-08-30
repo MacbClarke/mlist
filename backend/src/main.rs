@@ -18,9 +18,10 @@ use axum::routing::{any, delete, get, get_service, post};
 use handlers::{
     AppState, admin_audit_events_handler, admin_audit_resources_handler, admin_create_user_handler,
     admin_delete_user_handler, admin_disable_user_handler, admin_enable_user_handler,
-    admin_reset_totp_handler, admin_users_handler, bootstrap_finish_handler,
-    bootstrap_start_handler, create_file_link_handler, direct_file_handler, favorites_handler,
-    file_states_handler, list_handler, login_handler, logout_handler, me_handler, refresh_handler,
+    admin_reset_totp_handler, admin_users_handler, batch_download_handler,
+    bootstrap_finish_handler, bootstrap_start_handler, create_batch_link_handler,
+    create_file_link_handler, direct_file_handler, favorites_handler, file_states_handler,
+    list_handler, login_handler, logout_handler, me_handler, refresh_handler,
     set_favorite_handler, set_file_state_handler,
 };
 use serde_json::json;
@@ -78,6 +79,8 @@ async fn main() {
         .route("/api/auth/logout", post(logout_handler))
         .route("/api/me", get(me_handler))
         .route("/api/file-link", post(create_file_link_handler))
+        .route("/api/batch-link", post(create_batch_link_handler))
+        .route("/api/batch-download", get(batch_download_handler))
         .route("/api/file-states", get(file_states_handler))
         .route("/api/file-states", post(set_file_state_handler))
         .route("/api/favorites", get(favorites_handler))

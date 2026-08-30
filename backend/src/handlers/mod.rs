@@ -18,5 +18,8 @@ pub use auth::{
     refresh_handler,
 };
 pub use favorites::{favorites_handler, file_states_handler, set_favorite_handler, set_file_state_handler};
-pub use files::{create_file_link_handler, direct_file_handler, list_handler};
+pub use files::{
+    batch_download_handler, create_batch_link_handler, create_file_link_handler,
+    direct_file_handler, list_handler,
+};
 pub use types::AppState;

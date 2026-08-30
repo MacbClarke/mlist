@@ -195,3 +195,11 @@ pub struct AuthSession {
     pub user: UserRecord,
     pub expires_at: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTokenPayload {
+    pub paths: Vec<String>,
+    pub base_path: Option<String>,
+    pub name: Option<String>,
+}

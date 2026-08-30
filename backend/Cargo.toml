@@ -21,6 +21,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { version = "1.15.1", features = ["v4"] }
 time = { version = "0.3.37", features = ["formatting"] }
+async_zip = { version = "0.0.19", features = ["tokio", "deflate"] }
 
 [dev-dependencies]
 futures-util = "0.3.32"

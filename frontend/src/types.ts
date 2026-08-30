@@ -140,6 +140,17 @@ export type SignedFileLinkResponse = {
     expiresAt: string;
 };
 
+export type SignedBatchLinkRequest = {
+    paths: string[];
+    basePath?: string;
+    name?: string;
+};
+
+export type SignedBatchLinkResponse = {
+    url: string;
+    expiresAt: string;
+};
+
 export type ApiError = {
     code?: string;
     message?: string;

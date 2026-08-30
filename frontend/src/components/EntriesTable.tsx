@@ -42,6 +42,9 @@ export function EntriesTable({
     onDownload,
     onCopy,
     onUnmarkHighlight,
+    selectedPaths,
+    onToggleSelect,
+    onSelectAll,
 }: {
     entries: ListEntry[];
     sorting: { sort: SortField; order: SortOrder };
@@ -52,7 +55,18 @@ export function EntriesTable({
     onDownload: (entry: ListEntry) => void;
     onCopy: (entry: ListEntry) => void;
     onUnmarkHighlight: (entry: ListEntry) => void;
+    selectedPaths?: Set<string>;
+    onToggleSelect?: (entry: ListEntry) => void;
+    onSelectAll?: () => void;
 }) {
+    const allSelected =
+        entries.length > 0 && selectedPaths
+            ? entries.every((e) => selectedPaths.has(e.path))
+            : false;
+    const someSelected = selectedPaths
+        ? entries.some((e) => selectedPaths.has(e.path))
+        : false;
+
     const columns = useMemo<ColumnDef<ListEntry>[]>(
         () => [
             {
@@ -129,7 +143,23 @@ export function EntriesTable({
                             colSpan={columns.length}
                             className="h-9 p-0"
                         >
-                            <div className="grid w-full grid-cols-[1fr_auto_auto] items-center gap-3 px-3 sm:grid-cols-[1fr_7rem_9rem]">
+                            <div className="grid w-full grid-cols-[1.5rem_1fr_auto_auto] items-center gap-3 px-3 sm:grid-cols-[1.5rem_1fr_7rem_9rem]">
+                                <div className="flex items-center justify-center">
+                                    <input
+                                        type="checkbox"
+                                        ref={(el) => {
+                                            if (el) {
+                                                el.indeterminate =
+                                                    someSelected && !allSelected;
+                                            }
+                                        }}
+                                        checked={allSelected}
+                                        onChange={onSelectAll}
+                                        className="size-4 cursor-pointer rounded border-border accent-primary"
+                                        aria-label="全选"
+                                        title="全选"
+                                    />
+                                </div>
                                 {headerGroup.headers.map((header) => (
                                     <Fragment key={header.id}>
                                         {flexRender(
@@ -146,33 +176,54 @@ export function EntriesTable({
             <TableBody>
                 {table.getRowModel().rows.map((row) => {
                     const entry = row.original;
+                    const isSelected = selectedPaths?.has(entry.path) ?? false;
                     const highlighted =
                         entry.kind === "file" && isFileHighlighted(entry.path);
                     return (
                         <TableRow
                             key={entry.path}
-                            className={`h-auto ${highlighted ? "bg-emerald-100/70 hover:bg-emerald-100" : "hover:bg-muted/50"}`}
+                            className={`h-auto ${
+                                isSelected
+                                    ? "bg-primary/10 hover:bg-primary/15"
+                                    : highlighted
+                                      ? "bg-emerald-100/70 hover:bg-emerald-100 dark:bg-emerald-950/40"
+                                      : "hover:bg-muted/50"
+                            }`}
                         >
                             <TableCell colSpan={columns.length} className="p-0">
                                 <ContextMenu>
                                     <ContextMenuTrigger asChild>
-                                        <button
-                                            type="button"
-                                            onClick={() => onOpen(entry)}
-                                            className="grid w-full grid-cols-[1fr_auto_auto] items-center gap-3 px-3 py-2.5 text-left sm:grid-cols-[1fr_7rem_9rem]"
-                                        >
-                                            {row
-                                                .getVisibleCells()
-                                                .map((cell) => (
-                                                    <Fragment key={cell.id}>
-                                                        {flexRender(
-                                                            cell.column
-                                                                .columnDef.cell,
-                                                            cell.getContext(),
-                                                        )}
-                                                    </Fragment>
-                                                ))}
-                                        </button>
+                                        <div className="grid w-full grid-cols-[1.5rem_1fr_auto_auto] items-center gap-3 px-3 py-2.5 text-left sm:grid-cols-[1.5rem_1fr_7rem_9rem]">
+                                            <div
+                                                className="flex items-center justify-center"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isSelected}
+                                                    onChange={() => onToggleSelect?.(entry)}
+                                                    className="size-4 cursor-pointer rounded border-border accent-primary"
+                                                    aria-label={`选择 ${entry.name}`}
+                                                />
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => onOpen(entry)}
+                                                className="col-span-3 grid grid-cols-[1fr_auto_auto] items-center gap-3 text-left sm:grid-cols-[1fr_7rem_9rem]"
+                                            >
+                                                {row
+                                                    .getVisibleCells()
+                                                    .map((cell) => (
+                                                        <Fragment key={cell.id}>
+                                                            {flexRender(
+                                                                cell.column
+                                                                    .columnDef.cell,
+                                                                cell.getContext(),
+                                                            )}
+                                                        </Fragment>
+                                                    ))}
+                                            </button>
+                                        </div>
                                     </ContextMenuTrigger>
                                     <ContextMenuContent className="w-44">
                                         {entry.kind === "file" ? (
@@ -202,7 +253,16 @@ export function EntriesTable({
                                                     复制链接
                                                 </ContextMenuItem>
                                             </>
-                                        ) : null}
+                                        ) : (
+                                            <ContextMenuItem
+                                                onSelect={() =>
+                                                    onDownload(entry)
+                                                }
+                                            >
+                                                <DownloadIcon className="mr-2 size-4" />
+                                                打包下载 (ZIP)
+                                            </ContextMenuItem>
+                                        )}
                                         <ContextMenuItem
                                             onSelect={() =>
                                                 onToggleFavorite(entry)

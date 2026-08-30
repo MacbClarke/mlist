@@ -56,6 +56,13 @@ pub(super) fn content_disposition_inline(path: &Path) -> String {
     format!("inline; filename=\"{escaped_fallback}\"; filename*=UTF-8''{encoded}")
 }
 
+pub(super) fn content_disposition_attachment(raw_name: &str) -> String {
+    let fallback = ascii_filename_fallback(raw_name);
+    let escaped_fallback = escape_quoted_string(&fallback);
+    let encoded = rfc5987_encode(raw_name);
+    format!("attachment; filename=\"{escaped_fallback}\"; filename*=UTF-8''{encoded}")
+}
+
 fn ascii_filename_fallback(raw_name: &str) -> String {
     let mut out = String::with_capacity(raw_name.len());
     for ch in raw_name.chars() {

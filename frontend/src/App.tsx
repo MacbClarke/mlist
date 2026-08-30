@@ -23,6 +23,7 @@ import { LoginView } from "@/views/LoginView";
 import {
     ApiRequestError,
     apiJson,
+    createSignedBatchLink,
     createSignedFileLink,
     fetchMe,
     refreshAccessToken,
@@ -71,6 +72,9 @@ function App() {
         () => new Set(),
     );
     const [favoriteFiles, setFavoriteFiles] = useState<Set<string>>(
+        () => new Set(),
+    );
+    const [selectedPaths, setSelectedPaths] = useState<Set<string>>(
         () => new Set(),
     );
     const [view, setView] = useState<"all" | "favorites">("all");
@@ -210,6 +214,7 @@ function App() {
 
     async function loadPath(path: string, options: LoadPathOptions = {}) {
         clearSearchDebounce();
+        setSelectedPaths(new Set());
         const requestPath = normalizePath(path);
         const allowPathAsFile = options.allowPathAsFile !== false;
         const requestedPreviewPath =
@@ -430,6 +435,64 @@ function App() {
         document.body.appendChild(anchor);
         anchor.click();
         anchor.remove();
+    }
+
+    async function downloadEntry(entry: ListEntry) {
+        if (entry.kind === "dir") {
+            const zipName = `${entry.name}.zip`;
+            await downloadBatch([entry.path], zipName);
+            return;
+        }
+        await downloadFile(entry);
+    }
+
+    async function downloadBatch(paths: string[], name?: string) {
+        if (paths.length === 0) return;
+        const toastId = toast.loading("正在准备打包下载...");
+        try {
+            const payload = await createSignedBatchLink(
+                paths,
+                currentPath || undefined,
+                name,
+            );
+            toast.dismiss(toastId);
+            const anchor = document.createElement("a");
+            anchor.href = payload.url;
+            anchor.download = name ?? "download.zip";
+            anchor.rel = "noreferrer";
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+
+            for (const p of paths) {
+                void markFileHighlighted(p);
+            }
+            toast.success("已开始下载 ZIP 包");
+        } catch (err) {
+            toast.dismiss(toastId);
+            toast.error(err instanceof Error ? err.message : "打包下载失败");
+        }
+    }
+
+    function toggleSelect(entry: ListEntry) {
+        setSelectedPaths((previous) => {
+            const next = new Set(previous);
+            if (next.has(entry.path)) {
+                next.delete(entry.path);
+            } else {
+                next.add(entry.path);
+            }
+            return next;
+        });
+    }
+
+    function selectAll() {
+        setSelectedPaths((previous) => {
+            if (previous.size === entries.length) {
+                return new Set();
+            }
+            return new Set(entries.map((item) => item.path));
+        });
     }
 
     function isFileHighlighted(path: string): boolean {
@@ -854,11 +917,14 @@ function App() {
                             onOpen={openEntry}
                             onToggleFavorite={toggleFavorite}
                             isFileHighlighted={isFileHighlighted}
-                            onDownload={(entry) => void downloadFile(entry)}
+                            onDownload={(entry) => void downloadEntry(entry)}
                             onCopy={(entry) => void copyDownloadAddress(entry)}
                             onUnmarkHighlight={(entry) =>
                                 void unmarkFileHighlighted(entry.path)
                             }
+                            selectedPaths={selectedPaths}
+                            onToggleSelect={toggleSelect}
+                            onSelectAll={selectAll}
                         />
                     )}
                 </CardContent>
@@ -888,6 +954,34 @@ function App() {
                         disabled={!hasMore || loading}
                     >
                         下一页
+                    </Button>
+                </div>
+            ) : null}
+
+            {selectedPaths.size > 0 ? (
+                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 rounded-xl border bg-background/95 px-4 py-2.5 shadow-2xl backdrop-blur">
+                    <span className="text-sm font-medium">
+                        已选择 {selectedPaths.size} 项
+                    </span>
+                    <Button
+                        size="sm"
+                        onClick={() => {
+                            const selectedList = Array.from(selectedPaths);
+                            const defaultName = currentPath
+                                ? `${currentPath.split("/").pop() || "files"}-selected.zip`
+                                : "mlist-selected.zip";
+                            void downloadBatch(selectedList, defaultName);
+                        }}
+                    >
+                        <DownloadIcon className="mr-1.5 size-4" />
+                        打包下载 (ZIP)
+                    </Button>
+                    <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setSelectedPaths(new Set())}
+                    >
+                        取消选择
                     </Button>
                 </div>
             ) : null}

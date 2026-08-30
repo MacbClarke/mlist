@@ -158,6 +158,12 @@ async fn test_batch_download_flow() {
         .unwrap();
     assert!(!body_bytes.is_empty());
 
+    let highlighted = db.list_highlighted_files(user.id).await.unwrap();
+    let highlighted_paths: std::collections::HashSet<_> =
+        highlighted.into_iter().map(|f| f.path).collect();
+    assert!(highlighted_paths.contains("a.txt"));
+    assert!(highlighted_paths.contains("sub/b.txt"));
+
     let _ = tokio::fs::remove_dir_all(&root_dir).await;
     let _ = tokio::fs::remove_file(&db_path).await;
 }

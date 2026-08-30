@@ -359,6 +359,21 @@ pub async fn create_batch_link_handler(
         name: payload.name,
     };
 
+    let files = collect_files_for_zip(
+        root,
+        session.user.role.is_admin(),
+        &batch_payload.paths,
+        batch_payload.base_path.as_deref(),
+    )
+    .await?;
+
+    for item in &files {
+        let _ = state
+            .db
+            .set_file_highlighted(session.user.id, &item.relative_path, true)
+            .await;
+    }
+
     let expires_at = state
         .db
         .create_signed_batch_token(
@@ -395,6 +410,13 @@ pub async fn batch_download_handler(
 
     if files.is_empty() {
         return Err(ApiError::bad_request("No accessible files to download."));
+    }
+
+    for item in &files {
+        let _ = state
+            .db
+            .set_file_highlighted(session.user.id, &item.relative_path, true)
+            .await;
     }
 
     let raw_zip_name = if let Some(custom_name) = batch_payload.name {
@@ -497,6 +519,7 @@ pub async fn batch_download_handler(
 }
 
 struct ZipItem {
+    relative_path: String,
     resolved_path: PathBuf,
     zip_rel_path: String,
 }
@@ -528,6 +551,7 @@ async fn collect_files_for_zip(
             let zip_rel = make_zip_path(&norm, base_path, true);
             let unique_zip_path = make_unique_path(zip_rel, &mut seen_zip_paths);
             items.push(ZipItem {
+                relative_path: norm.clone(),
                 resolved_path: resolved,
                 zip_rel_path: unique_zip_path,
             });
@@ -574,6 +598,7 @@ async fn collect_files_for_zip(
                         let zip_rel = make_zip_path(&entry_rel, base_path, false);
                         let unique_zip_path = make_unique_path(zip_rel, &mut seen_zip_paths);
                         items.push(ZipItem {
+                            relative_path: entry_rel,
                             resolved_path: entry_resolved,
                             zip_rel_path: unique_zip_path,
                         });

@@ -364,7 +364,7 @@ function App() {
         const payload = await queryClient.fetchQuery({
             queryKey: queryKeys.fileStates(),
             queryFn: () => apiJson<FileStatesResponse>("/api/file-states"),
-            staleTime: 60 * 1000,
+            staleTime: 0,
         });
         setHighlightedFiles(
             new Set(
@@ -442,9 +442,8 @@ function App() {
             toast.dismiss(toastId);
             const url = toAbsoluteUrl(payload.url);
             await navigator.clipboard.writeText(url);
-            for (const p of paths) {
-                void markFileHighlighted(p);
-            }
+            await loadHighlightedFilesFromServer();
+            setSelectedPaths(new Set());
             toast.success("已复制下载链接");
         } catch (err) {
             toast.dismiss(toastId);
@@ -483,6 +482,10 @@ function App() {
                 name,
             );
             toast.dismiss(toastId);
+
+            await loadHighlightedFilesFromServer();
+            setSelectedPaths(new Set());
+
             const anchor = document.createElement("a");
             anchor.href = payload.url;
             anchor.download = name ?? "download.zip";
@@ -491,9 +494,6 @@ function App() {
             anchor.click();
             anchor.remove();
 
-            for (const p of paths) {
-                void markFileHighlighted(p);
-            }
             toast.success("已开始下载 ZIP 包");
         } catch (err) {
             toast.dismiss(toastId);

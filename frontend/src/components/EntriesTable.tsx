@@ -1,5 +1,6 @@
 import { Fragment, useMemo } from "react";
 import {
+    CheckSquareIcon,
     CircleOffIcon,
     CopyIcon,
     DownloadIcon,
@@ -66,6 +67,7 @@ export function EntriesTable({
     const someSelected = selectedPaths
         ? entries.some((e) => selectedPaths.has(e.path))
         : false;
+    const hasSelection = (selectedPaths?.size ?? 0) > 0;
 
     const columns = useMemo<ColumnDef<ListEntry>[]>(
         () => [
@@ -143,8 +145,14 @@ export function EntriesTable({
                             colSpan={columns.length}
                             className="h-9 p-0"
                         >
-                            <div className="grid w-full grid-cols-[1.5rem_1fr_auto_auto] items-center gap-3 px-3 sm:grid-cols-[1.5rem_1fr_7rem_9rem]">
-                                <div className="flex items-center justify-center">
+                            <div className="group grid w-full grid-cols-[1.5rem_1fr_auto_auto] items-center gap-3 px-3 sm:grid-cols-[1.5rem_1fr_7rem_9rem]">
+                                <div
+                                    className={`flex items-center justify-center transition-opacity duration-150 ${
+                                        hasSelection
+                                            ? "opacity-100"
+                                            : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                                    }`}
+                                >
                                     <input
                                         type="checkbox"
                                         ref={(el) => {
@@ -182,7 +190,7 @@ export function EntriesTable({
                     return (
                         <TableRow
                             key={entry.path}
-                            className={`h-auto ${
+                            className={`group h-auto ${
                                 isSelected
                                     ? "bg-primary/10 hover:bg-primary/15"
                                     : highlighted
@@ -195,7 +203,11 @@ export function EntriesTable({
                                     <ContextMenuTrigger asChild>
                                         <div className="grid w-full grid-cols-[1.5rem_1fr_auto_auto] items-center gap-3 px-3 py-2.5 text-left sm:grid-cols-[1.5rem_1fr_7rem_9rem]">
                                             <div
-                                                className="flex items-center justify-center"
+                                                className={`flex items-center justify-center transition-opacity duration-150 ${
+                                                    hasSelection || isSelected
+                                                        ? "opacity-100"
+                                                        : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                                                }`}
                                                 onClick={(e) => e.stopPropagation()}
                                             >
                                                 <input
@@ -263,6 +275,18 @@ export function EntriesTable({
                                                 打包下载
                                             </ContextMenuItem>
                                         )}
+                                        {onToggleSelect ? (
+                                            <ContextMenuItem
+                                                onSelect={() =>
+                                                    onToggleSelect(entry)
+                                                }
+                                            >
+                                                <CheckSquareIcon className="mr-2 size-4" />
+                                                {isSelected
+                                                    ? "取消选择"
+                                                    : "多选"}
+                                            </ContextMenuItem>
+                                        ) : null}
                                         <ContextMenuItem
                                             onSelect={() =>
                                                 onToggleFavorite(entry)

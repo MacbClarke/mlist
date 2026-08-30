@@ -414,6 +414,11 @@ function App() {
     }
 
     async function copyDownloadAddress(entry: ListEntry) {
+        if (entry.kind === "dir") {
+            const zipName = `${entry.name}.zip`;
+            await copyBatchDownloadLink([entry.path], zipName);
+            return;
+        }
         try {
             const payload = await createSignedFileLink(entry.path);
             const url = toAbsoluteUrl(payload.url);
@@ -422,6 +427,28 @@ function App() {
             toast.success("已复制");
         } catch {
             toast.error("复制失败，请检查浏览器剪贴板权限。");
+        }
+    }
+
+    async function copyBatchDownloadLink(paths: string[], name?: string) {
+        if (paths.length === 0) return;
+        const toastId = toast.loading("正在生成下载链接...");
+        try {
+            const payload = await createSignedBatchLink(
+                paths,
+                currentPath || undefined,
+                name,
+            );
+            toast.dismiss(toastId);
+            const url = toAbsoluteUrl(payload.url);
+            await navigator.clipboard.writeText(url);
+            for (const p of paths) {
+                void markFileHighlighted(p);
+            }
+            toast.success("已复制下载链接");
+        } catch (err) {
+            toast.dismiss(toastId);
+            toast.error(err instanceof Error ? err.message : "生成下载链接失败");
         }
     }
 
@@ -975,6 +1002,20 @@ function App() {
                     >
                         <DownloadIcon className="mr-1.5 size-4" />
                         打包下载
+                    </Button>
+                    <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                            const selectedList = Array.from(selectedPaths);
+                            const defaultName = currentPath
+                                ? `${currentPath.split("/").pop() || "files"}-selected.zip`
+                                : "mlist-selected.zip";
+                            void copyBatchDownloadLink(selectedList, defaultName);
+                        }}
+                    >
+                        <CopyIcon className="mr-1.5 size-4" />
+                        复制链接
                     </Button>
                     <Button
                         size="sm"

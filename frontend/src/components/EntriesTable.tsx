@@ -266,14 +266,24 @@ export function EntriesTable({
                                                 </ContextMenuItem>
                                             </>
                                         ) : (
-                                            <ContextMenuItem
-                                                onSelect={() =>
-                                                    onDownload(entry)
-                                                }
-                                            >
-                                                <DownloadIcon className="mr-2 size-4" />
-                                                打包下载
-                                            </ContextMenuItem>
+                                            <>
+                                                <ContextMenuItem
+                                                    onSelect={() =>
+                                                        onDownload(entry)
+                                                    }
+                                                >
+                                                    <DownloadIcon className="mr-2 size-4" />
+                                                    打包下载
+                                                </ContextMenuItem>
+                                                <ContextMenuItem
+                                                    onSelect={() =>
+                                                        onCopy(entry)
+                                                    }
+                                                >
+                                                    <CopyIcon className="mr-2 size-4" />
+                                                    复制链接
+                                                </ContextMenuItem>
+                                            </>
                                         )}
                                         {onToggleSelect ? (
                                             <ContextMenuItem

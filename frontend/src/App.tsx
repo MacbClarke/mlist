@@ -66,6 +66,7 @@ function App() {
     const [entries, setEntries] = useState<ListEntry[]>([]);
     const [previewEntry, setPreviewEntry] = useState<ListEntry | null>(null);
     const [loading, setLoading] = useState(false);
+    const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState("");
     const [pathNotFound, setPathNotFound] = useState(false);
     const [highlightedFiles, setHighlightedFiles] = useState<Set<string>>(
@@ -248,10 +249,12 @@ function App() {
             search: effectiveSearch.trim() || undefined,
         });
 
-        const cachedPayload = queryClient.getQueryData<ListResponse>(queryKey);
+        const cachedPayload = options.forceRefetch
+            ? undefined
+            : queryClient.getQueryData<ListResponse>(queryKey);
         if (cachedPayload) {
             applyListPayload(cachedPayload, requestedPreviewPath, options);
-        } else {
+        } else if (!options.forceRefetch) {
             setLoading(true);
         }
         setError("");
@@ -276,7 +279,7 @@ function App() {
                 queryKey,
                 queryFn: () =>
                     apiJson<ListResponse>(`/api/list?${params.toString()}`),
-                staleTime: 30 * 1000,
+                staleTime: options.forceRefetch ? 0 : 30 * 1000,
             });
             applyListPayload(payload, requestedPreviewPath, options);
         } catch (err) {
@@ -715,6 +718,33 @@ function App() {
         });
     }
 
+    async function handleRefresh() {
+        if (loading || refreshing) return;
+        setRefreshing(true);
+        const startTime = Date.now();
+        try {
+            await queryClient.resetQueries({
+                queryKey: ["list"],
+            });
+            await Promise.all([
+                loadPath(currentPath, {
+                    resetOffset: true,
+                    forceRefetch: true,
+                }),
+                loadHighlightedFilesFromServer(),
+                loadFavoriteFilesFromServer(),
+            ]);
+        } finally {
+            const elapsed = Date.now() - startTime;
+            const remaining = Math.max(0, 300 - elapsed);
+            if (remaining > 0) {
+                setTimeout(() => setRefreshing(false), remaining);
+            } else {
+                setRefreshing(false);
+            }
+        }
+    }
+
     if (authLoading) {
         return (
             <Shell>
@@ -858,18 +888,13 @@ function App() {
                 <Button
                     variant="outline"
                     size="icon"
-                    onClick={() => {
-                        void queryClient.invalidateQueries({
-                            queryKey: ["list"],
-                        });
-                        void loadPath(currentPath, { resetOffset: true });
-                    }}
-                    disabled={loading}
+                    onClick={() => void handleRefresh()}
+                    disabled={loading || refreshing}
                     aria-label="刷新"
                     title="刷新"
                 >
                     <RefreshCwIcon
-                        className={`size-4 ${loading ? "animate-spin" : ""}`}
+                        className={`size-4 ${loading || refreshing ? "animate-spin" : ""}`}
                     />
                 </Button>
             </div>

@@ -167,6 +167,7 @@ export type LoadPathOptions = {
     offsetOverride?: number;
     viewOverride?: "all" | "favorites";
     searchOverride?: string;
+    forceRefetch?: boolean;
 };
 
 export const AUDIT_PAGE_SIZE = 50;

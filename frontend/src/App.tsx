@@ -728,7 +728,6 @@ function App() {
             });
             await Promise.all([
                 loadPath(currentPath, {
-                    resetOffset: true,
                     forceRefetch: true,
                 }),
                 loadHighlightedFilesFromServer(),

@@ -150,7 +150,7 @@ export function EntriesTable({
                                     className={`flex items-center justify-center transition-opacity duration-150 ${
                                         hasSelection
                                             ? "opacity-100"
-                                            : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                                            : "opacity-0 group-hover:opacity-100 has-[:focus-visible]:opacity-100"
                                     }`}
                                 >
                                     <input
@@ -213,7 +213,7 @@ export function EntriesTable({
                                                 className={`flex items-center justify-center transition-opacity duration-150 ${
                                                     hasSelection || isSelected
                                                         ? "opacity-100"
-                                                        : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                                                        : "opacity-0 group-hover:opacity-100 has-[:focus-visible]:opacity-100"
                                                 }`}
                                                 onClick={(e) => e.stopPropagation()}
                                             >
